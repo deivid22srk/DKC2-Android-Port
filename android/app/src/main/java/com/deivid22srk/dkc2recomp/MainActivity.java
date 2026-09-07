@@ -31,6 +31,10 @@ public class MainActivity extends SDLActivity {
     private static final long MIN_ROM_BYTES = 4_000_000L;
 
     private File romFile;
+    /** Set by getArguments when no ROM exists yet: the native SDL_main is
+     * alive waiting for the picker's copy, so finishing the pick must NOT
+     * recreate the activity (that would race the waiting native loop). */
+    private volatile boolean waitingForRom = false;
 
     @Override
     protected String[] getLibraries() {
@@ -44,6 +48,7 @@ public class MainActivity extends SDLActivity {
         if (romFile != null && romFile.isFile() && romFile.length() > 0) {
             return new String[] { romFile.getAbsolutePath() };
         }
+        waitingForRom = true;
         return new String[0];
     }
 
@@ -112,7 +117,12 @@ public class MainActivity extends SDLActivity {
                 return;
             }
             Toast.makeText(this, R.string.rom_ready, Toast.LENGTH_SHORT).show();
-            recreate(); // restart so the SDL thread boots with the ROM path
+            if (waitingForRom) {
+                // First run: the native SDL_main loop picks the file up and
+                // starts the game in this same activity instance.
+            } else {
+                recreate(); // replace-ROM flow: restart SDL with the new path
+            }
         } else {
             staging.delete();
             Toast.makeText(this, R.string.rom_invalid, Toast.LENGTH_LONG)

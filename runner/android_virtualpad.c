@@ -33,7 +33,10 @@ void Dkc2AndroidVirtualPadInit(void) {
   desc.nbuttons = 16;
   desc.button_mask = 0xFFFFu;
   desc.axis_mask = 0x3Fu;
-  (void)snprintf(desc.name, sizeof(desc.name), "%s", "DKC2 Touch Pad");
+  /* SDL2's descriptor stores a borrowed name pointer (SDL3 uses a char
+   * array); the string must therefore outlive the attach call. */
+  static const char kVirtualPadName[] = "DKC2 Touch Pad";
+  desc.name = kVirtualPadName;
 
   int device_index = SDL_JoystickAttachVirtualEx(&desc);
   if (device_index < 0) {
@@ -58,6 +61,17 @@ void Dkc2AndroidVirtualPadButton(int button, int pressed) {
   if (!s_virtual_joystick || button < 0 || button > 15) return;
   SDL_JoystickSetVirtualButton(s_virtual_joystick, button,
                                pressed ? 1 : 0);
+}
+
+void Dkc2AndroidVirtualPadQuit(void) {
+  /* SDL_Quit destroys every joystick handle. Drop our reference and reset
+   * the statics so a later host run in this process re-attaches instead of
+   * writing through a dangling pointer. */
+  if (s_virtual_joystick) {
+    SDL_JoystickClose(s_virtual_joystick);
+  }
+  s_virtual_joystick = NULL;
+  s_device_index = -1;
 }
 
 void Dkc2AndroidVirtualPadLeftStick(float x, float y) {

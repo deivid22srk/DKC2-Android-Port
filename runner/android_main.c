@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifndef DKC2_RELEASE_VERSION
@@ -62,6 +63,13 @@ int SDL_main(int argc, char *argv[]) {
     fprintf(stderr, "warning: internal storage path unavailable\n");
   }
 
+  /* EVENTS+TIMER only: the first-run wait loop below must observe SDL quit
+   * requests (activity teardown) before RunGame initializes the remaining
+   * subsystems. RunGame's own SDL_Init call adds them. */
+  if (SDL_Init(SDL_INIT_EVENTS | SDL_INIT_TIMER) != 0) {
+    fprintf(stderr, "warning: SDL_Init(events/timer): %s\n", SDL_GetError());
+  }
+
   Dkc2DiagnosticsInit("android", DKC2_RELEASE_VERSION);
 
   RecompLauncherCSettings settings;
@@ -72,13 +80,41 @@ int SDL_main(int argc, char *argv[]) {
     (void)Dkc2LauncherReadRomCache(rom_path, sizeof rom_path);
   }
   if (!rom_path[0]) {
-    fprintf(stderr,
-            "No ROM was provided. Select a game file in the app first.\n");
-    return 0;
+    /* First run: SDLActivity finishes the activity as soon as SDL_main
+     * returns, so returning here would close the app before the SAF picker
+     * can be used. Stay alive and wait for the picker's copy into internal
+     * storage instead; a quit request (activity recreate/teardown) ends the
+     * wait, and the replacement run receives the path through argv. */
+    const char *dir = user_dir && *user_dir ? user_dir : ".";
+    char candidate[kPathCapacity];
+    for (;;) {
+      if (SDL_QuitRequested()) return 0;
+      (void)snprintf(candidate, sizeof candidate, "%s/rom.sfc", dir);
+      struct stat st;
+      if (stat(candidate, &st) == 0 && st.st_size > 0) {
+        (void)snprintf(rom_path, sizeof rom_path, "%s", candidate);
+        break;
+      }
+      SDL_Delay(250);
+    }
   }
   (void)Dkc2LauncherWriteRomCache(rom_path);
 
   int result = Dkc2RunGameHost(rom_path, &settings);
   (void)Dkc2LauncherSettingsSave(&settings);
+
+  if (result != 0) {
+    /* Self-healing: park the rejected file (wrong SHA-256, truncated copy,
+     * ...) so the next launch reopens the picker instead of failing on the
+     * same bad ROM forever. */
+    char rejected[kPathCapacity];
+    (void)snprintf(rejected, sizeof rejected, "%s.rejected", rom_path);
+    if (rename(rom_path, rejected) == 0) {
+      fprintf(stderr, "DKC2Recomp: ROM parked as %s\n", rejected);
+    } else {
+      fprintf(stderr, "warning: could not park rejected ROM: %s\n",
+              strerror(errno));
+    }
+  }
   return result;
 }

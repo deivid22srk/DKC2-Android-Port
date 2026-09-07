@@ -393,6 +393,11 @@ static void ShutdownHost(SdlHost *host) {
   host->overlay = NULL;
   Dkc2SdlPresenterDestroy(&host->presenter);
   Dkc2DesktopColorFilterDestroy(&host->color_filter);
+#ifdef __ANDROID__
+  /* Release the virtual touch gamepad before SDL_Quit invalidates the
+   * handle, so a later host run in this process re-attaches cleanly. */
+  Dkc2AndroidVirtualPadQuit();
+#endif
   SDL_Quit();
 }
 

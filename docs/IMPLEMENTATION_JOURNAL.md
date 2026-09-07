@@ -5396,3 +5396,23 @@ pacing question starts from the same instrument.
   passes, AOT generation with the native analyzer matches the committed
   `recomp/funcs.h` byte-for-byte, and `assembleDebug`/`assembleRelease`
   produce installable arm64-v8a APKs. CI builds the same pipeline.
+
+### Critical-review fix pass (post first green CI)
+
+- Fixed the guaranteed boot crash: SDL2 2.30.9's `SDL_VirtualJoystickDesc.name`
+  is a borrowed pointer, not a char array; the touch-pad descriptor now
+  assigns a static string instead of snprintf-ing into NULL.
+- First-run flow: SDL_main no longer returns without a ROM (SDLActivity
+  finishes the activity the moment SDL_main returns). It initializes
+  EVENTS+TIMER and waits for the SAF picker's copy into internal storage,
+  observing SDL quit requests so activity teardown stays clean.
+- Invalid ROMs are parked as `rom.sfc.rejected` after a failed run so the
+  next launch reopens the picker instead of failing forever.
+- Virtual gamepad teardown (`Dkc2AndroidVirtualPadQuit`) hooked before
+  SDL_Quit in ShutdownHost, removing the dangling-handle write on ROM
+  replacement runs.
+- MainActivity only recreates the activity in the replace-ROM flow; the
+  first-run pick starts the game in the same instance (no double-run race).
+- Release APKs are now signed with a project keystore stored in Actions
+  secrets (DKC2_RELEASE_KEYSTORE_B64 + passwords); debug-key fallback kept.
+- allowBackup disabled (ROM/saves stay on device); FBO macro guard split.

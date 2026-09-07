@@ -32,6 +32,10 @@ enum {
  * device is discovered by the normal hotplug/scan path. Idempotent. */
 void Dkc2AndroidVirtualPadInit(void);
 
+/* Release the virtual device before SDL_Quit destroys it; resets internal
+ * state so Init can attach again in a later host run. */
+void Dkc2AndroidVirtualPadQuit(void);
+
 /* Set one logical button's pressed state. Ignored before Init. */
 void Dkc2AndroidVirtualPadButton(int button, int pressed);
 
