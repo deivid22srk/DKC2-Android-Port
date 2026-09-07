@@ -76,6 +76,15 @@ int SDL_main(int argc, char *argv[]) {
   RecompLauncherCSettings settings;
   Dkc2LauncherSettingsDefault(&settings);
   Dkc2LauncherSettingsLoad(&settings);
+  /* The window must be born fullscreen on Android. With the flag set,
+   * SDLActivity applies its own immersive window style (and arms its
+   * re-hide listener); MainActivity additionally enforces modern
+   * WindowInsetsController immersive mode. Without it the surface keeps
+   * the 1439x678 system-bar-inset geometry and SDL's window size can
+   * latch inconsistent pairs during inset animations. There is no ImGui
+   * launcher on Android to write launcher.cfg, so the loaded default
+   * (0) must be overridden here. */
+  settings.fullscreen = 1;
   /* Phones have no hardware keyboard, and the shared default routes
    * player 1 to it (desktop convention). A keyboard-source player never
    * consumes a gamepad, so the virtual pad landed on player 2 and the

@@ -10,6 +10,8 @@
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
         android:hardwareAccelerated="true"
+        android:appCategory="game"
+        android:isGame="true"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
 
         <activity

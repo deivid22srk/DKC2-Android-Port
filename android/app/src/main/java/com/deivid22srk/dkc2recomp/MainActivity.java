@@ -2,8 +2,14 @@ package com.deivid22srk.dkc2recomp;
 
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.widget.Toast;
 
 import java.io.File;
@@ -60,6 +66,72 @@ public class MainActivity extends SDLActivity {
             requestRomPick();
         }
         attachTouchOverlay();
+        // SDLActivity.onCreate unconditionally queues setWindowStyle(false)
+        // on this looper, which clears the theme's FLAG_FULLSCREEN after our
+        // onCreate returns. Posting keeps FIFO order so this runs AFTER that
+        // command and wins.
+        getWindow().getDecorView().post(this::applyImmersiveMode);
+    }
+
+    /**
+     * True fullscreen: hide the status bar AND the navigation bar,
+     * sticky-immersive (a swipe shows them transiently as an overlay without
+     * resizing the game surface). Re-applied on focus gain and resume; the
+     * SDL window also carries SDL_WINDOW_FULLSCREEN_DESKTOP (see
+     * runner/android_main.c) so the vendored SDLActivity style path and this
+     * one agree instead of fighting.
+     */
+    private void applyImmersiveMode() {
+        Window window = getWindow();
+        if (Build.VERSION.SDK_INT >= 30 /* Android 11 */) {
+            window.setDecorFitsSystemWindows(false);
+            WindowInsetsController controller = window.getInsetsController();
+            if (controller != null) {
+                controller.hide(WindowInsets.Type.statusBars()
+                        | WindowInsets.Type.navigationBars());
+                controller.setSystemBarsBehavior(
+                        WindowInsetsController
+                                .BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+        } else {
+            // API 26-29: legacy immersive-sticky flags.
+            View decor = window.getDecorView();
+            decor.setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    | View.SYSTEM_UI_FLAG_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+            window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            window.clearFlags(
+                    WindowManager.LayoutParams.FLAG_FORCE_NOT_FULLSCREEN);
+        }
+        if (Build.VERSION.SDK_INT >= 28 /* Android 9 */) {
+            // Draw into the camera-cutout area in landscape (short edges);
+            // the game letterboxes inside, the touch overlay stays usable.
+            WindowManager.LayoutParams attributes = window.getAttributes();
+            attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams
+                    .LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            window.setAttributes(attributes);
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            // Canonical re-apply point: covers the SAF picker return,
+            // Recents, Home and notification shade. Never touch the bars
+            // while focus is lost (would fight the system picker UI).
+            applyImmersiveMode();
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        applyImmersiveMode();
     }
 
     private void attachTouchOverlay() {

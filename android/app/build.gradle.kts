@@ -14,8 +14,8 @@ android {
         applicationId = "com.deivid22srk.dkc2recomp"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "0.0.7-android"
+        versionCode = 4
+        versionName = "0.0.8-android"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }

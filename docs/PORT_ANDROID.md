@@ -150,11 +150,28 @@ The CMake configure fetches SDL 2.30.9 (pinned, shallow) on first run.
   created (rotatable in-session, EGL surface churn on rotation);
   `SDL_HINT_ORIENTATIONS` restores the landscape lock.
 - **GLES2 present path.** The frame quad is a VBO drawn as two explicit
-  triangles (a client-side 4-vertex TRIANGLE_STRIP lost its second
-  triangle on a reported Adreno tiler: frozen black half-frame along the
-  quad diagonal); any drawable-size change forces a full texture
-  redefine; one GL error per site is surfaced via `SDL_Log` (logcat:
+  triangles that tile along a single diagonal (the earlier
+  4-vertex-strip / wrong-pair layouts — (BL,BR,TR)+(BR,TR,TL) — cover only
+  75% of the quad: the wedge between the two diagonals stays at the clear
+  color, which was the on-device black arrowhead); the raster size is
+  answered by `eglQuerySurface` on the real EGLSurface (SDL's window
+  logical size on Android is fed by asynchronous JNI events and can latch
+  mismatched device/surface pairs, which letterboxed the game off-center);
+  frames are skipped while the surface has no authoritative size (picker,
+  rotation); any drawable-size change forces a full texture redefine; one
+  GL error per site is surfaced via `SDL_Log` (logcat:
   `DKC2 GLES2: GL error ...`).
+- **True fullscreen.** The window is born
+  `SDL_WINDOW_FULLSCREEN_DESKTOP` (`android_main.c`) and
+  `MainActivity` enforces immersive mode via `WindowInsetsController`
+  (API 30+) or legacy system-UI flags (API 26-29), re-applied on focus
+  gain and resume, with `SHORT_EDGES` cutout mode. The status and
+  navigation bars only reappear transiently (swipe) or over system UI
+  such as the ROM picker.
+- **Game recognition.** The manifest carries `android:appCategory="game"`
+  and `android:isGame="true"` plus the optional gamepad feature, so
+  launchers, OEM game tools (e.g. Moto Game Time) and the Play listing
+  treat the app as a game.
 - **Audio telemetry.** The obtained audio spec, open failures, the 48 kHz
   fallback, and backgrounding/foreground queue sizes log to logcat
   (`audio: ...`), so field reports can be diagnosed without repro.

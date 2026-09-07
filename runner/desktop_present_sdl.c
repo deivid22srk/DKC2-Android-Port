@@ -8,6 +8,8 @@
 /* The desktop SDL_opengl.h maps to GLES1 on Android; the presenter needs the
  * GLES2 core (shaders, VBOs, framebuffer objects). */
 #include <SDL_opengles2.h>
+#include <EGL/egl.h>
+#include <android/native_window.h>
 #else
 #include <SDL_opengl.h>
 #endif
@@ -81,6 +83,59 @@ static Dkc2GlShaderApi s_gl;
 static GLuint s_quad_vbo;
 static const GLfloat kQuadVertices[24];
 static void LogGlErrorProbe(const char *where);
+
+/* Authoritative raster size of the Android surface. SDL's window w/h on
+ * Android is fed by asynchronous JNI surface events (delivered on the UI
+ * thread, deduped, never re-sent after fullscreen style changes), so
+ * during system-bar/inset animations and surface swaps it can latch
+ * mismatched pairs - device width 1600 with surface height 678 was
+ * measured on device and letterboxed the game off-center. The Android
+ * driver implements neither GL_GetDrawableSize nor GetWindowSizeInPixels,
+ * so SDL answers from those latched logical values. eglQuerySurface
+ * answers for the exact back-buffer glViewport rasterizes into;
+ * ANativeWindow is the next-best witness; the SDL query is the last
+ * resort. Returns false when nothing answers (surface mid-teardown): the
+ * caller should skip the frame instead of presenting into an undefined
+ * buffer. */
+static bool AndroidSurfaceSize(SDL_Window *window, int *width, int *height) {
+  if (!window || !width || !height) return false;
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (SDL_GetWindowWMInfo(window, &info) &&
+      info.subsystem == SDL_SYSWM_ANDROID) {
+    EGLDisplay display = eglGetCurrentDisplay();
+    EGLSurface surface = info.info.android.surface;
+    if (display != EGL_NO_DISPLAY && surface != EGL_NO_SURFACE) {
+      EGLint query_width = 0, query_height = 0;
+      if (eglQuerySurface(display, surface, EGL_WIDTH, &query_width) &&
+          eglQuerySurface(display, surface, EGL_HEIGHT, &query_height) &&
+          query_width > 0 && query_height > 0) {
+        *width = (int)query_width;
+        *height = (int)query_height;
+        return true;
+      }
+    }
+    if (info.info.android.window) {
+      int native_width = ANativeWindow_getWidth(info.info.android.window);
+      int native_height = ANativeWindow_getHeight(info.info.android.window);
+      if (native_width > 0 && native_height > 0) {
+        *width = native_width;
+        *height = native_height;
+        return true;
+      }
+    }
+  }
+  {
+    int sdl_width = 0, sdl_height = 0;
+    SDL_GL_GetDrawableSize(window, &sdl_width, &sdl_height);
+    if (sdl_width > 0 && sdl_height > 0) {
+      *width = sdl_width;
+      *height = sdl_height;
+      return true;
+    }
+  }
+  return false;
+}
 #endif
 
 static bool LoadShaderApi(void) {
@@ -651,7 +706,11 @@ void Dkc2SdlPresenterDrawableSize(Dkc2SdlPresenter *presenter, int *width,
   if (width) *width = 0;
   if (height) *height = 0;
   if (!presenter || !presenter->window) return;
+#ifdef __ANDROID__
+  (void)AndroidSurfaceSize((SDL_Window *)presenter->window, width, height);
+#else
   SDL_GL_GetDrawableSize((SDL_Window *)presenter->window, width, height);
+#endif
 }
 
 void Dkc2SdlPresenterArmCapture(Dkc2SdlPresenter *presenter, uint8_t *rgb,
@@ -664,16 +723,23 @@ void Dkc2SdlPresenterArmCapture(Dkc2SdlPresenter *presenter, uint8_t *rgb,
 }
 
 #ifdef __ANDROID__
-/* Fullscreen quad as two explicit GL_TRIANGLES. NDC positions with the
- * matching texture coordinates (row 0 of the frame maps to the top edge
- * of the viewport). Six vertices remove any reliance on how a driver
- * splits a 4-vertex strip into triangles. */
+/* Fullscreen quad as two explicit GL_TRIANGLES sharing the BL-TR diagonal.
+ * NDC positions with the matching texture coordinates (row 0 of the frame
+ * maps to the top edge of the viewport). Both triangles must split along
+ * ONE diagonal: pairing (BL,BR,TR) with (BR,TR,TL) shares only the
+ * right-hand side edge, and their union leaves the left wedge between the
+ * two NDC diagonals at the clear color - measured on device as a black
+ * arrowhead covering 25% of the viewport, tip at the viewport center,
+ * edges along the diagonals (screen slope = viewport width/height = 4/3).
+ * That is a vertex-data defect, not a driver quirk: the same pair is what
+ * a 4-vertex strip (v0..v3 = BL,BR,TR,TL) expands to, which is why the
+ * wedge survived the earlier strip-to-triangles rewrite unchanged. */
 static const GLfloat kQuadVertices[] = {
     -1.0f, -1.0f, 0.0f, 1.0f,
      1.0f, -1.0f, 1.0f, 1.0f,
      1.0f,  1.0f, 1.0f, 0.0f,
 
-     1.0f, -1.0f, 1.0f, 1.0f,
+    -1.0f, -1.0f, 0.0f, 1.0f,
      1.0f,  1.0f, 1.0f, 0.0f,
     -1.0f,  1.0f, 0.0f, 0.0f,
 };
@@ -728,7 +794,16 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
   if (SDL_GL_MakeCurrent(window, context) != 0) return false;
   int output_width = 0;
   int output_height = 0;
+#ifdef __ANDROID__
+  if (!AndroidSurfaceSize(window, &output_width, &output_height)) {
+    /* Surface mid-teardown (file picker, rotation, task switch): presenting
+     * into an undefined buffer produced stale-content slivers on device;
+     * skip this frame - the next Present re-queries. */
+    return true;
+  }
+#else
   SDL_GL_GetDrawableSize(window, &output_width, &output_height);
+#endif
 #ifdef __ANDROID__
   /* The Android surface is destroyed and recreated behind the same EGL
    * context (file picker, rotation, task switches). The GL objects survive
@@ -883,6 +958,7 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
       glPixelStorei(GL_PACK_ALIGNMENT, 1);
       glReadPixels(0, 0, output_width, output_height, GL_RGB,
                    GL_UNSIGNED_BYTE, presenter->capture_rgb);
+      glPixelStorei(GL_PACK_ALIGNMENT, 4);
       const size_t row = (size_t)output_width * 3u;
       uint8_t *tmp = (uint8_t *)malloc(row);
       if (tmp) {

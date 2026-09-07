@@ -46,11 +46,12 @@ typedef struct Dkc2SdlPresenter {
 #ifdef __ANDROID__
 /* GLES2 has no fixed-function path: the base textured-quad program is
  * always built at Init, and every Present goes through a program. The
- * fullscreen quad lives in a VBO drawn as two explicit triangles: the
- * original client-side 4-vertex TRIANGLE_STRIP lost its second triangle
- * on at least one Adreno tiler (left half of the frame stayed at the
- * clear color), so the present path avoids both client arrays and
- * strip-splitting entirely. */
+ * fullscreen quad lives in a VBO drawn as two explicit triangles sharing
+ * one diagonal: a (BL,BR,TR)+(BR,TR,TL) pair covers only 75% of the quad
+ * (the left wedge between the two diagonals stays at the clear color on
+ * every GPU), so the vertex order must tile along a single diagonal.
+ * Client arrays and strip-splitting are avoided entirely. Raster size is
+ * answered by eglQuerySurface, not SDL's latched window logical size. */
   unsigned int base_program;
   int base_uniform_source;
   unsigned int quad_vbo;
