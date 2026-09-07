@@ -1,0 +1,153 @@
+# Research sources and reuse decisions
+
+This file records what each external source contributes, whether code may be
+reused, and how it fits the port. It is an engineering record, not legal
+advice.
+
+## DKC2-disassembly
+
+[H4v0c21/DKC2-disassembly](https://github.com/H4v0c21/DKC2-disassembly) is
+the strongest revision-specific map. Its North American revision-0 build at
+commit `59a3a8aef88d074f488d25d0d0623fcb37fa3791` was privately assembled and
+matched the supported ROM byte for byte. It identifies routines, data
+structures, compression streams, the SPC700 program, and hardware accesses.
+
+No explicit license was present at the validated revision. The project uses it
+as a private address/behavior reference. The checked-in `recomp/*.cfg` files
+mechanically preserve selected function labels, addresses, bounded ranges, and
+finite dispatch contracts needed to reproduce static generation; they do not
+include assembly source, comments, ROM bytes, or game data. This repository is
+kept private, and those derived labels/contracts require provenance and legal
+review before any public redistribution.
+
+The widescreen diagnostic decoder also uses the validated revision's factual
+sprite-table, render-table, camera, and sprite-field WRAM offsets. It reads
+values from private snapshots and emits original JSON labels; it does not copy
+the reference source or prose. The focused provenance/no-license record is in
+`third_party/dkc2_disassembly_reference/PROVENANCE.md`.
+
+The 2026-08-01 widescreen pass additionally used the factual level-config
+structure and gameplay dispatch to distinguish horizontal column-major,
+vertical row-major, and nonstandard screen families. This affects only local
+classification and independently implemented address arithmetic. DonkeyHacks
+was used as a secondary field-name cross-check; its code, prose, and tables
+were not reproduced.
+
+The 2026-08-03 Bramble pass used the same validated revision only to identify
+that sub-mode `$10` reaches the square scroll family and to orient the factual
+address operations. The independently implemented decoder expresses the
+result as a `$60`-byte metatile-row stride. A private WRAM/VRAM comparison,
+not copied reference data, validates 954/957 native cells at the retained
+frame. No assembly, comments, tables, graphics, or level data were copied.
+
+The same reference was used to identify that collectible bananas have a
+dedicated list traversal and direct OAM writer, distinct from the common
+object renderer. Local traces independently established the four native
+viewport constants and the coordinate/OAM high-bit behavior. The project
+implements its own narrow helper and generated-code adapter; no reference
+assembly, comments, tables, or assets were copied.
+
+The ignored Yoshifanatic1 WLA overlay is also an optional naming input. The
+source-owned promotion tool accepts only a context-qualified alias that
+retains the exact original `CODE_BBXXXX` identity, which avoids treating
+revision-shifted comments or adjacent dispatch slots as the same function.
+The retained 2026-08-09 pass expanded ten CFG names. No assembly body, comment,
+table, asset, ROM byte, or private overlay was added to the repository. The
+exact reference revision and GPL-3.0 notice are recorded under
+`third_party/yoshifanatic_dkc2_reference/`.
+
+## Donkey Kong hacking development documents
+
+The [DKC2 development documents](https://donkeyhacks.zouri.jp/html/En-Us/dkc2/index.html)
+cover sprite variables, WRAM, SRAM, ARAM, animation commands, Rareware music
+sequence data, compression, and selected disassembly. These are valuable for
+giving names and formats to behavior found in traces.
+
+The site prohibits unauthorized reproduction. Facts may guide independent
+implementations, but its prose, tables, and code are not copied into this
+repository.
+
+## dkcomp
+
+[Kingizor/dkcomp](https://github.com/Kingizor/dkcomp) is an MIT-licensed C
+library and command-line tool. Its `Big Data` format covers DKC2/DKC3 SNES
+tilesets, tilemaps, and metatiles. It is a good candidate for a future private
+asset-validation tool or for a properly attributed runtime decompressor.
+
+It is not required for the current reset/APU milestone. Before integrating it,
+add its license and a synthetic round-trip test; never commit its ROM-derived
+outputs.
+
+## snesrecomp
+
+[mstan/snesrecomp](https://github.com/mstan/snesrecomp) demonstrates the same
+high-level model selected here: translate reachable 65816 code to C, retain an
+emulated SNES hardware layer, and compare against a reference emulator. Its
+current public README describes an alpha framework with game-specific runner
+repositories and several games at varying playability.
+
+The repository also states that it has no declared overall license and no
+stable public API. As of the 2026-07-15 integration branch it is consumed as a
+pinned Git submodule for local research and upstream contribution, not copied
+into this repository. Public distribution of a combined binary remains blocked
+pending license clarification. See `docs/SNESRECOMP_INTEGRATION.md`.
+
+## LakeSnes APU core
+
+[angelo-wf/LakeSnes](https://github.com/angelo-wf/LakeSnes) is an MIT-licensed
+SNES emulator written in C. Version 0.4.0 imports only its SPC700, S-DSP,
+S-SMP timer/port, and save-state support from commit
+`9db90b86e46a377609305e298dd92d71cd1d4c8a`.
+
+The subset, license, provenance, and local changes live in
+`third_party/lakesnes_apu`. No LakeSnes 65816, PPU, cartridge, input, SDL, or
+frontend code is included.
+
+## Snes9x hardware behavior reference
+
+The official [Snes9x source repository](https://github.com/snes9xgit/snes9x)
+was consulted to cross-check the Mode-7 shared write latch, the signed
+`M7A * high_byte(M7B)` product exposed at `$2134-$2136`, and the delayed CPU
+arithmetic register behavior. Its official PPU register and graphics-renderer
+sources were also consulted for the shared background-offset latch, BGMODE
+fields, tiled-mode priority order, and object rules. For version 0.8, the
+official sources were additionally cross-checked for Mode-7 13-bit coordinate
+sign extension, low-six-bit product truncation, screen flips, outside repeat
+modes, interleaved VRAM addressing, BG1 palette selection, and EXTBG priority.
+It is a behavior reference only: no Snes9x PPU, CPU, platform, or frontend
+source is copied or linked into this project.
+
+The project-owned implementation is small and independently expressed, and
+its externally observable behavior is retained in synthetic tests. Hardware
+details must ultimately be confirmed by differential traces, because agreement
+with one emulator is not by itself proof of console accuracy.
+
+The official Snes9x 1.63 Windows release was also used privately as a visual
+oracle. Two captures of a sustained Rareware-logo frame exactly match the
+version-0.8 renderer after horizontal low-resolution normalization. A private
+snapshot-format-v12 state beside that frame also matches the runtime's VRAM,
+CGRAM, and OAM byte for byte. The small standard-library inspection tool reads
+only the documented block structure and fields needed for those hashes.
+Neither the executable, save states, screenshots, ROM, nor derived images are
+redistributed.
+
+## Hardware and conformance references
+
+- [SNESdev: Booting the SPC700](https://snes.nesdev.org/wiki/Booting_the_SPC700)
+  documents the `$AA/$BB`, `$CC`, byte-echo, and execute phases used by the
+  synthetic IPL test.
+- [SNESdev: S-SMP](https://snes.nesdev.org/wiki/S-SMP) documents the four
+  independent CPU/APU port directions, 64 KiB ARAM, timers, DSP registers, and
+  IPL mapping.
+- The WDC W65C816S data sheet and Tom Harte/SingleStepTests corpus remain the
+  CPU semantics and instruction-state conformance references.
+
+## Architecture decision
+
+Preserve the existing interpreter-first foundation as an independent validation
+harness and use the pinned `snesrecomp` submodule as the production recompiler
+and desktop-runner foundation. This changes the delivery architecture without
+discarding the revision-verified ROM loader, complete 65816 semantics,
+deterministic boot oracle, memory bus, DMA, APU, or exact Mode-7 comparison.
+Those results become differential evidence for the new runner rather than code
+that must be rewritten before a playable build can exist.

@@ -1,0 +1,1228 @@
+#include "dkc2_game.h"
+#include "dkc2_video.h"
+#include "input_playback.h"
+#include "verified_rom.h"
+
+#include "common_cpu_infra.h"
+#include "common_rtl.h"
+#include "audio_trace.h"
+#include "cpu_state.h"
+#include "cpu_trace.h"
+#include "debug_server.h"
+#include "sha256.h"
+#include "snes/ppu.h"
+#include "snes/apu.h"
+#include "snes/interp_bridge.h"
+#include "snes/snes.h"
+#include "snes/ws_shadow.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void PrintHash(FILE *stream, const uint8_t hash[32]) {
+  for (int i = 0; i < 32; i++) fprintf(stream, "%02x", hash[i]);
+}
+
+static uint16_t ReadWram16(size_t address) {
+  return (uint16_t)(g_ram[address] | ((uint16_t)g_ram[address + 1] << 8));
+}
+
+static int WidescreenTraceEnabled(void) {
+  static int checked;
+  static int enabled;
+  if (!checked) {
+    const char *text = getenv("DKC2_WIDESCREEN_TRACE");
+    enabled = text && *text && *text != '0';
+    checked = 1;
+  }
+  return enabled;
+}
+
+static long WidescreenTraceStep(void) {
+  static int checked;
+  static long step = 1;
+  if (!checked) {
+    const char *text = getenv("DKC2_WIDESCREEN_TRACE_STEP");
+    if (text && *text) {
+      char *end = NULL;
+      long parsed = strtol(text, &end, 10);
+      if (end && *end == '\0' && parsed > 0)
+        step = parsed;
+    }
+    checked = 1;
+  }
+  return step;
+}
+
+static long WidescreenTraceStart(void) {
+  static int checked;
+  static long start;
+  if (!checked) {
+    const char *text = getenv("DKC2_WIDESCREEN_TRACE_START");
+    if (text && *text) {
+      char *end = NULL;
+      long parsed = strtol(text, &end, 10);
+      if (end && *end == '\0' && parsed >= 0)
+        start = parsed;
+    }
+    checked = 1;
+  }
+  return start;
+}
+
+static void EmitWidescreenFrameTrace(long frame) {
+  enum {
+    kCameraX = 0x17BA,
+    kCameraY = 0x17C0,
+    kGameMode = 0x0024,
+    kGameSubMode = 0x0529,
+    kLevelNumber = 0x00D3,
+    kLevelMap = 0x0098,
+    kLevelBank = 0x009A,
+    kMetatileTable = 0x17B4,
+    kTerrainVram = 0x17B6,
+    kCameraMaxX = 0x0AFC,
+    kCameraMaxY = 0x0AFE,
+    kSpriteTable = 0x0D84,
+    kSpriteCount = 25,
+    kSpriteSize = 0x5E,
+    kSpriteType = 0x00,
+    kSpriteWorldX = 0x06,
+    kSpriteWorldY = 0x0A,
+    kSpriteCurrentGraphic = 0x1A,
+    kSpriteDisplayMode = 0x1C,
+    kSpriteState = 0x2E,
+    kSpriteSubState = 0x2F,
+    kSpritePlacement = 0x56,
+    kSpriteDespawnTime = 0x5A,
+    kSpriteDespawnCountdown = 0x5B
+  };
+  WsShadowMarginStat shadow[3];
+  Dkc2TerrainPrefillStats prefill;
+  Dkc2RiggingStats rigging;
+  Dkc2GeyserStats geysers;
+  Dkc2GetTerrainPrefillStats(&prefill);
+  Dkc2GetRiggingStats(&rigging);
+  Dkc2GetGeyserStats(&geysers);
+  WsShadowGetMarginStats(0, &shadow[0]);
+  WsShadowGetMarginStats(1, &shadow[1]);
+  WsShadowGetMarginStats(2, &shadow[2]);
+  fprintf(stderr,
+          "widescreen_frame={\"frame\":%ld,\"level\":%u,"
+          "\"game_mode\":%u,\"game_sub_mode\":%u,"
+          "\"camera\":[%u,%u],\"camera_max\":[%u,%u],"
+          "\"terrain_source\":{\"bank\":%u,\"map\":%u,"
+          "\"metatiles\":%u,\"vram\":%u,\"ready\":%u,"
+          "\"prefill\":[%llu,%llu,%llu,%llu],"
+          "\"margin_prefill\":[%llu,%llu,%llu],"
+          "\"wall\":[%llu,%llu,%llu],\"phase\":[%u,%u,%u],"
+          "\"stride\":[%u,%u]},"
+          "\"terrain_vram\":%u,"
+          "\"ppu\":{\"mode\":%u,\"inidisp\":%u,\"main\":%u,\"sub\":%u,"
+          "\"h\":[%u,%u,%u,%u],\"v\":[%u,%u,%u,%u],"
+          "\"bg_sc\":[%u,%u,%u,%u],\"wide\":%u,"
+          "\"clamp\":%u,\"mirror\":%u,\"repeat\":%u,"
+          "\"bias\":%d,\"left\":%u,\"right\":%u,\"bands\":%d,"
+          "\"planes\":[%d,%d],"
+          "\"window\":{\"w1\":[%u,%u],\"w2\":[%u,%u],\"sel\":%u,"
+          "\"log\":%u,\"tmw\":%u,\"tsw\":%u,\"cgwsel\":%u,"
+          "\"cgadsub\":%u}},"
+          "\"shadow\":["
+          "{\"west_hit\":%llu,\"west_miss\":%llu,"
+          "\"east_hit\":%llu,\"east_miss\":%llu,"
+          "\"west_fold\":%llu,\"east_fold\":%llu,"
+          "\"west_blank\":%llu,\"east_blank\":%llu,"
+          "\"west_raw\":%llu,\"east_raw\":%llu},"
+          "{\"west_hit\":%llu,\"west_miss\":%llu,"
+          "\"east_hit\":%llu,\"east_miss\":%llu,"
+          "\"west_fold\":%llu,\"east_fold\":%llu,"
+          "\"west_blank\":%llu,\"east_blank\":%llu,"
+          "\"west_raw\":%llu,\"east_raw\":%llu},"
+          "{\"west_hit\":%llu,\"west_miss\":%llu,"
+          "\"east_hit\":%llu,\"east_miss\":%llu,"
+          "\"west_fold\":%llu,\"east_fold\":%llu,"
+          "\"west_blank\":%llu,\"east_blank\":%llu,"
+          "\"west_raw\":%llu,\"east_raw\":%llu}],"
+          "\"rigging\":{\"configured\":%u,\"ready\":%u,"
+          "\"native\":[%u,%u,%u],\"margin\":%u},"
+          "\"geysers\":{\"configured\":%u,\"ready\":%u,"
+          "\"frame\":%u,\"predicted\":%u,\"native\":[%u,%u],"
+          "\"margin\":%u,\"listed\":%u},\"sprites\":[",
+          frame, (unsigned)ReadWram16(kLevelNumber),
+          (unsigned)ReadWram16(kGameMode),
+          (unsigned)ReadWram16(kGameSubMode),
+          (unsigned)ReadWram16(kCameraX), (unsigned)ReadWram16(kCameraY),
+          (unsigned)ReadWram16(kCameraMaxX),
+          (unsigned)ReadWram16(kCameraMaxY),
+          (unsigned)g_ram[kLevelBank], (unsigned)ReadWram16(kLevelMap),
+          (unsigned)ReadWram16(kMetatileTable),
+          (unsigned)ReadWram16(kTerrainVram),
+          Dkc2VideoTerrainReady() ? 1u : 0u,
+          (unsigned long long)prefill.expected,
+          (unsigned long long)prefill.decoded,
+          (unsigned long long)prefill.present,
+          (unsigned long long)prefill.matching,
+          (unsigned long long)prefill.margin_expected,
+          (unsigned long long)prefill.margin_present,
+          (unsigned long long)prefill.margin_matching,
+          (unsigned long long)prefill.structural,
+          (unsigned long long)prefill.mirrored,
+          (unsigned long long)prefill.chained,
+          (unsigned)prefill.phase_h, (unsigned)prefill.phase_v,
+          (unsigned)prefill.phase_from_band,
+          (unsigned)prefill.row_bytes, (unsigned)prefill.row_match_percent,
+          (unsigned)ReadWram16(kTerrainVram),
+          (unsigned)(g_ppu->bgmode & 7u),
+          (unsigned)g_ppu->inidisp,
+          (unsigned)g_ppu->screenEnabled[0],
+          (unsigned)g_ppu->screenEnabled[1],
+          (unsigned)g_ppu->hScroll[0], (unsigned)g_ppu->hScroll[1],
+          (unsigned)g_ppu->hScroll[2], (unsigned)g_ppu->hScroll[3],
+          (unsigned)g_ppu->vScroll[0], (unsigned)g_ppu->vScroll[1],
+          (unsigned)g_ppu->vScroll[2], (unsigned)g_ppu->vScroll[3],
+          (unsigned)g_ppu->bgXsc[0], (unsigned)g_ppu->bgXsc[1],
+          (unsigned)g_ppu->bgXsc[2], (unsigned)g_ppu->bgXsc[3],
+          (unsigned)g_ppu->wsLayerWidenMask,
+          (unsigned)g_ppu->wsLayerClamp,
+          (unsigned)g_ppu->wsLayerMirror,
+          (unsigned)g_ppu->wsLayerRepeat,
+          (int)g_ppu->wsPresentationXBias,
+          (unsigned)g_ppu->extraLeftCur,
+          (unsigned)g_ppu->extraRightCur,
+          Dkc2GetHdmaBandCount(),
+          Dkc2GetPlaneBandCount(0), Dkc2GetPlaneBandCount(1),
+          (unsigned)g_ppu->window1left, (unsigned)g_ppu->window1right,
+          (unsigned)g_ppu->window2left, (unsigned)g_ppu->window2right,
+          (unsigned)g_ppu->windowsel, (unsigned)g_ppu->wbgobjlog,
+          (unsigned)g_ppu->screenWindowed[0],
+          (unsigned)g_ppu->screenWindowed[1], (unsigned)g_ppu->cgwsel,
+          (unsigned)g_ppu->cgadsub,
+          (unsigned long long)shadow[0].westHit,
+          (unsigned long long)shadow[0].westMiss,
+          (unsigned long long)shadow[0].eastHit,
+          (unsigned long long)shadow[0].eastMiss,
+          (unsigned long long)shadow[0].westFold,
+          (unsigned long long)shadow[0].eastFold,
+          (unsigned long long)shadow[0].westBlank,
+          (unsigned long long)shadow[0].eastBlank,
+          (unsigned long long)shadow[0].westRawFallback,
+          (unsigned long long)shadow[0].eastRawFallback,
+          (unsigned long long)shadow[1].westHit,
+          (unsigned long long)shadow[1].westMiss,
+          (unsigned long long)shadow[1].eastHit,
+          (unsigned long long)shadow[1].eastMiss,
+          (unsigned long long)shadow[1].westFold,
+          (unsigned long long)shadow[1].eastFold,
+          (unsigned long long)shadow[1].westBlank,
+          (unsigned long long)shadow[1].eastBlank,
+          (unsigned long long)shadow[1].westRawFallback,
+          (unsigned long long)shadow[1].eastRawFallback,
+          (unsigned long long)shadow[2].westHit,
+          (unsigned long long)shadow[2].westMiss,
+          (unsigned long long)shadow[2].eastHit,
+          (unsigned long long)shadow[2].eastMiss,
+          (unsigned long long)shadow[2].westFold,
+          (unsigned long long)shadow[2].eastFold,
+          (unsigned long long)shadow[2].westBlank,
+          (unsigned long long)shadow[2].eastBlank,
+          (unsigned long long)shadow[2].westRawFallback,
+          (unsigned long long)shadow[2].eastRawFallback,
+          (unsigned)rigging.configured, (unsigned)rigging.ready,
+          (unsigned)rigging.native_expected,
+          (unsigned)rigging.native_matching,
+          (unsigned)rigging.native_shifted,
+          (unsigned)rigging.margin_decoded,
+          (unsigned)geysers.configured, (unsigned)geysers.ready,
+          (unsigned)geysers.frame, (unsigned)geysers.frame_predicted,
+          (unsigned)geysers.native_expected,
+          (unsigned)geysers.native_matching,
+          (unsigned)geysers.margin_decoded,
+          (unsigned)geysers.margin_geysers);
+  /* DKC2_SPRITE_RECORD=<slot>: after the sprite list, print that slot's
+   * whole $5E-byte object record as hex words, one line per traced frame,
+   * to watch the fields an object's routine advances while it idles. */
+  int emitted = 0;
+  for (int slot = 0; slot < kSpriteCount; slot++) {
+    size_t base = kSpriteTable + (size_t)slot * kSpriteSize;
+    uint16_t type = ReadWram16(base + kSpriteType);
+    if (!type)
+      continue;
+    fprintf(stderr,
+            "%s{\"slot\":%d,\"type\":%u,\"world\":[%u,%u],"
+            "\"graphic\":%u,\"display\":%u,\"state\":%u,"
+            "\"sub_state\":%u,\"placement\":%u,"
+            "\"despawn_time\":%u,\"despawn_countdown\":%u}",
+            emitted ? "," : "", slot, (unsigned)type,
+            (unsigned)ReadWram16(base + kSpriteWorldX),
+            (unsigned)ReadWram16(base + kSpriteWorldY),
+            (unsigned)ReadWram16(base + kSpriteCurrentGraphic),
+            (unsigned)g_ram[base + kSpriteDisplayMode],
+            (unsigned)g_ram[base + kSpriteState],
+            (unsigned)g_ram[base + kSpriteSubState],
+            (unsigned)ReadWram16(base + kSpritePlacement),
+            (unsigned)g_ram[base + kSpriteDespawnTime],
+            (unsigned)g_ram[base + kSpriteDespawnCountdown]);
+    emitted = 1;
+  }
+  fprintf(stderr, "],\"terrain_tiles\":[");
+  {
+    const char *record = getenv("DKC2_SPRITE_RECORD");
+    if (record && *record) {
+      const long slot = strtol(record, NULL, 10);
+      if (slot >= 0 && slot < kSpriteCount) {
+        const size_t base = kSpriteTable + (size_t)slot * kSpriteSize;
+        fprintf(stderr, "\nsprite_record frame=%ld slot=%ld:", frame, slot);
+        for (size_t offset = 0; offset < kSpriteSize; offset += 2)
+          fprintf(stderr, " %04x", (unsigned)ReadWram16(base + offset));
+      }
+    }
+  }
+  int terrain_layer = -1;
+  const unsigned enabled =
+      (unsigned)(g_ppu->screenEnabled[0] | g_ppu->screenEnabled[1]);
+  const uint16_t terrain_vram = ReadWram16(kTerrainVram);
+  for (int layer = 0; layer < 2; layer++) {
+    if ((enabled & (1u << layer)) &&
+        (uint16_t)PPU_bgTilemapAdr(g_ppu, layer) == terrain_vram) {
+      terrain_layer = terrain_layer < 0 ? layer : -2;
+    }
+  }
+  emitted = 0;
+  if (terrain_layer >= 0 && WsShadowLayerActive(terrain_layer)) {
+    const unsigned shift = PPU_bigTiles(g_ppu, terrain_layer) ? 4u : 3u;
+    const int tile_size = 1 << shift;
+    const int tile_mask = tile_size - 1;
+    const uint32_t world_x = WsShadowWorldX(terrain_layer);
+    const uint32_t world_y = WsShadowWorldY(terrain_layer);
+    int first_x = -kDkc2VideoWidescreenExtra;
+    while (((int)world_x + first_x) & tile_mask)
+      first_x++;
+    int first_y = 0;
+    while (((int)world_y + first_y) & tile_mask)
+      first_y++;
+    for (int y = first_y; y + tile_size <= kDkc2VideoHeight;
+         y += tile_size) {
+      const uint32_t ty = (world_y + (uint32_t)y) >> shift;
+      for (int x = first_x;
+           x + tile_size <= kDkc2VideoNativeWidth +
+                                kDkc2VideoWidescreenExtra;
+           x += tile_size) {
+        const int64_t pixel_x = (int64_t)world_x + x;
+        if (pixel_x < 0)
+          continue;
+        const uint32_t tx = (uint32_t)pixel_x >> shift;
+        uint16_t entry = 0;
+        const int valid =
+            WsShadowLookupWorldTile(terrain_layer, tx, ty, &entry) ? 1 : 0;
+        fprintf(stderr, "%s[%d,%d,%u,%u,%d]", emitted ? "," : "",
+                x, y, (unsigned)tx, (unsigned)ty,
+                valid ? (int)entry : -1);
+        emitted = 1;
+      }
+    }
+  }
+  fprintf(stderr, "]}\n");
+}
+
+static void StoreLe16(uint8_t **cursor, uint16_t value) {
+  *(*cursor)++ = (uint8_t)value;
+  *(*cursor)++ = (uint8_t)(value >> 8);
+}
+
+static void StoreLe32(uint8_t **cursor, uint32_t value) {
+  StoreLe16(cursor, (uint16_t)value);
+  StoreLe16(cursor, (uint16_t)(value >> 16));
+}
+
+static int WriteFramePpm(const char *path, const uint8_t *pixels,
+                         size_t width, size_t height, size_t pitch) {
+  FILE *stream = fopen(path, "wb");
+  if (!stream) return 0;
+  int ok = fprintf(stream, "P6\n%zu %zu\n255\n", width, height) > 0;
+  for (size_t y = 0; ok && y < height; y++) {
+    const uint8_t *row = pixels + y * pitch;
+    for (size_t x = 0; ok && x < width; x++) {
+      const uint8_t rgb[3] = { row[x * 4 + 2], row[x * 4 + 1],
+                               row[x * 4] };
+      ok = fwrite(rgb, 1, sizeof rgb, stream) == sizeof rgb;
+    }
+  }
+  if (fclose(stream) != 0) ok = 0;
+  return ok;
+}
+
+static int ParseFrameNumber(const char *text, long fallback, long *value) {
+  if (!text || !*text) {
+    *value = fallback;
+    return 1;
+  }
+  char *end = NULL;
+  long parsed = strtol(text, &end, 10);
+  if (!end || *end != '\0' || parsed < 0)
+    return 0;
+  *value = parsed;
+  return 1;
+}
+
+static unsigned long long s_trace_pc_hits;
+static uint32_t s_trace_path[32];
+static size_t s_trace_path_count;
+static size_t s_trace_path_index;
+
+static void TracePc(CpuState *cpu, uint32_t pc24) {
+  s_trace_pc_hits++;
+  if (s_trace_pc_hits <= 16 ||
+      (s_trace_pc_hits & (s_trace_pc_hits - 1)) == 0) {
+    fprintf(stderr,
+            "dkc2_trace_pc hit=%llu frame=%d pc=$%06x a=$%04x x=$%04x "
+            "y=$%04x s=$%04x db=$%02x p=$%02x continuation=$%04x "
+            "dispatcher=$%04x intro_state=$%04x dp42=$%04x dp44=$%04x "
+            "dp46=$%04x dp48=$%04x "
+            "links30/60/70/80/90/a0/b0/d0=$%04x/$%04x/$%04x/$%04x/"
+            "$%04x/$%04x/$%04x/$%04x\n",
+            s_trace_pc_hits, snes_frame_counter, (unsigned)pc24, cpu->A,
+            cpu->X, cpu->Y, cpu->S, cpu->DB, cpu->P,
+            (unsigned)(g_ram[0x20] | ((unsigned)g_ram[0x21] << 8)),
+            (unsigned)(g_ram[0x24] | ((unsigned)g_ram[0x25] << 8)),
+            (unsigned)(g_ram[0x2a] | ((unsigned)g_ram[0x2b] << 8)),
+            (unsigned)(g_ram[0x42] | ((unsigned)g_ram[0x43] << 8)),
+            (unsigned)(g_ram[0x44] | ((unsigned)g_ram[0x45] << 8)),
+            (unsigned)(g_ram[0x46] | ((unsigned)g_ram[0x47] << 8)),
+            (unsigned)(g_ram[0x48] | ((unsigned)g_ram[0x49] << 8)),
+            (unsigned)(g_ram[0x1a670] | ((unsigned)g_ram[0x1a671] << 8)),
+            (unsigned)(g_ram[0x1a6a0] | ((unsigned)g_ram[0x1a6a1] << 8)),
+            (unsigned)(g_ram[0x1a6b0] | ((unsigned)g_ram[0x1a6b1] << 8)),
+            (unsigned)(g_ram[0x1a6c0] | ((unsigned)g_ram[0x1a6c1] << 8)),
+            (unsigned)(g_ram[0x1a6d0] | ((unsigned)g_ram[0x1a6d1] << 8)),
+            (unsigned)(g_ram[0x1a6e0] | ((unsigned)g_ram[0x1a6e1] << 8)),
+            (unsigned)(g_ram[0x1a6f0] | ((unsigned)g_ram[0x1a6f1] << 8)),
+            (unsigned)(g_ram[0x1a710] | ((unsigned)g_ram[0x1a711] << 8)));
+    fflush(stderr);
+  }
+  if (s_trace_path_index + 1 < s_trace_path_count) {
+    s_trace_path_index++;
+    s_trace_pc_hits = 0;
+    interp_bridge_set_pre_opcode_hook(s_trace_path[s_trace_path_index],
+                                      TracePc);
+    fprintf(stderr, "dkc2_trace_path next=$%06x\n",
+            (unsigned)s_trace_path[s_trace_path_index]);
+    fflush(stderr);
+  }
+}
+
+static int ArmTracePath(const char *text) {
+  const char *cursor = text;
+  while (*cursor) {
+    if (s_trace_path_count == sizeof s_trace_path / sizeof s_trace_path[0])
+      return 0;
+    char *end = NULL;
+    unsigned long pc = strtoul(cursor, &end, 16);
+    if (end == cursor || pc > 0xfffffful || (*end != ',' && *end != '\0'))
+      return 0;
+    s_trace_path[s_trace_path_count++] = (uint32_t)pc;
+    if (*end == '\0') break;
+    cursor = end + 1;
+  }
+  if (!s_trace_path_count) return 0;
+  interp_bridge_set_pre_opcode_hook(s_trace_path[0], TracePc);
+  fprintf(stderr, "dkc2_trace_path armed=%zu first=$%06x\n",
+          s_trace_path_count, (unsigned)s_trace_path[0]);
+  return 1;
+}
+
+int main(int argc, char **argv) {
+  if (argc < 2 || argc > 3) {
+    fprintf(stderr, "usage: dkc2_snesrecomp_headless <rom.sfc> [frames]\n");
+    return 2;
+  }
+  long frame_limit = argc == 3 ? strtol(argv[2], NULL, 10) : 600;
+  if (frame_limit < 1 || frame_limit > 1000000) {
+    fprintf(stderr, "frames must be between 1 and 1000000\n");
+    return 2;
+  }
+
+  size_t rom_size = 0;
+  char rom_error[160];
+  uint8_t *rom =
+      Dkc2ReadVerifiedRom(argv[1], &rom_size, rom_error, sizeof rom_error);
+  if (!rom) {
+    fprintf(stderr, "%s: %s\n", rom_error, argv[1]);
+    return 2;
+  }
+
+  Dkc2VideoAspect aspect = kDkc2VideoAspectNative;
+  const char *aspect_text = getenv("DKC2_ASPECT");
+  if (aspect_text && *aspect_text) {
+    if (!Dkc2VideoAspectFromName(aspect_text, &aspect)) {
+      fprintf(stderr, "DKC2_ASPECT must be 4:3, 16:10, or 16:9\n");
+      free(rom);
+      return 2;
+    }
+  } else {
+    const char *widescreen_text = getenv("DKC2_WIDESCREEN");
+    if (widescreen_text && *widescreen_text && *widescreen_text != '0')
+      aspect = kDkc2VideoAspect16x9;
+  }
+  Dkc2VideoSetAspect(aspect);
+  {
+    const char *edge_text = getenv("DKC2_WIDESCREEN_EDGE");
+    Dkc2VideoEdgePolicy edge_policy = kDkc2VideoEdgeGlide;
+    if (edge_text && *edge_text) {
+      if (!Dkc2VideoEdgePolicyFromName(edge_text, &edge_policy)) {
+        fprintf(stderr,
+                "DKC2_WIDESCREEN_EDGE must be reflect, bars, shift, or glide\n");
+        free(rom);
+        return 2;
+      }
+      Dkc2VideoSetEdgePolicy(edge_policy);
+    }
+  }
+  RtlRegisterGame(Dkc2GameInfo());
+  if (!SnesInit(rom, (int)rom_size)) {
+    fprintf(stderr, "snesrecomp rejected the verified ROM\n");
+    free(rom);
+    return 4;
+  }
+
+  /* Optional exact desktop-state reproduction. The headless host normally
+   * starts with blank SRAM; point DKC2_SRAM_INPUT at a private save.srm to
+   * replay a desktop-only path without copying private data into the tree. */
+  const char *sram_input = getenv("DKC2_SRAM_INPUT");
+  if (sram_input && *sram_input) {
+    FILE *f = fopen(sram_input, "rb");
+    bool loaded = f && g_sram && g_sram_size > 0 &&
+                  fread(g_sram, 1, (size_t)g_sram_size, f) ==
+                      (size_t)g_sram_size &&
+                  fgetc(f) == EOF;
+    if (f) fclose(f);
+    if (!loaded) {
+      fprintf(stderr, "unable to load exact SRAM image: %s\n", sram_input);
+      free(rom);
+      return 13;
+    }
+  }
+
+  /* Load a captured desktop slot at a frame boundary for deterministic
+   * post-state differential runs. The snapshot includes the game-specific
+   * continuation context through Dkc2GameInfo's state hooks. */
+  const char *savestate_input = getenv("DKC2_SAVESTATE_INPUT");
+  if (savestate_input && *savestate_input &&
+      !RtlLoadSnapshot(savestate_input)) {
+    fprintf(stderr, "unable to load exact savestate: %s\n", savestate_input);
+    free(rom);
+    return 14;
+  }
+
+#if SNESRECOMP_TRACE
+  if (debug_server_init(4382) != 0) {
+    free(rom);
+    return 11;
+  }
+  if (cpu_trace_init() == 0) {
+    free(rom);
+    return 12;
+  }
+  debug_server_set_ram(g_ram, 0x20000);
+  atexit(debug_server_shutdown);
+#endif
+
+  const char *trace_path_text = getenv("DKC2_TRACE_PATH");
+  const char *trace_pc_text = getenv("DKC2_TRACE_PC");
+  if (trace_path_text && *trace_path_text) {
+    if (!ArmTracePath(trace_path_text)) {
+      fprintf(stderr,
+              "DKC2_TRACE_PATH must be a comma-separated list of 24-bit "
+              "hexadecimal addresses\n");
+      free(rom);
+      return 2;
+    }
+  } else if (trace_pc_text && *trace_pc_text) {
+    char *end = NULL;
+    unsigned long trace_pc = strtoul(trace_pc_text, &end, 16);
+    if (!end || *end != '\0' || trace_pc > 0xfffffful) {
+      fprintf(stderr, "DKC2_TRACE_PC must be a 24-bit hexadecimal address\n");
+      free(rom);
+      return 2;
+    }
+    interp_bridge_set_pre_opcode_hook((uint32_t)trace_pc, TracePc);
+    fprintf(stderr, "dkc2_trace_pc armed=$%06lx\n", trace_pc);
+  }
+
+  enum {
+    kBufferWidth = kDkc2VideoWidescreenWidth,
+    kHeight = kDkc2VideoHeight,
+    kBytesPerPixel = kDkc2VideoBytesPerPixel
+  };
+  static uint8_t pixels[kBufferWidth * kHeight * kBytesPerPixel];
+  const size_t frame_width = (size_t)Dkc2VideoWidth();
+  const size_t frame_bytes = frame_width * kHeight * kBytesPerPixel;
+  Dkc2BeginDrawing(pixels, frame_width * kBytesPerPixel);
+
+  const char *frame_sequence_prefix = getenv("DKC2_FRAME_PPM_PREFIX");
+  long frame_sequence_start = 0;
+  long frame_sequence_end = frame_limit - 1;
+  long frame_sequence_step = 1;
+  if (frame_sequence_prefix && *frame_sequence_prefix &&
+      (!ParseFrameNumber(getenv("DKC2_FRAME_PPM_START"), 0,
+                         &frame_sequence_start) ||
+       !ParseFrameNumber(getenv("DKC2_FRAME_PPM_END"), frame_limit - 1,
+                         &frame_sequence_end) ||
+       !ParseFrameNumber(getenv("DKC2_FRAME_PPM_STEP"), 1,
+                         &frame_sequence_step) ||
+       frame_sequence_step < 1 ||
+       frame_sequence_start > frame_sequence_end ||
+       frame_sequence_end >= frame_limit)) {
+    fprintf(stderr,
+            "invalid DKC2_FRAME_PPM_START/END/STEP sequence range\n");
+    free(rom);
+    return 18;
+  }
+
+  enum { kMaximumAudioFramesPerVideoFrame = 534 };
+  int16_t audio[kMaximumAudioFramesPerVideoFrame * 2];
+  /* Snes9x reports 60.098811862 Hz and the SNES DSP produces 32,040 stereo
+   * frames per second. Carry the fraction between host frames instead of
+   * consuming 534 frames unconditionally (which runs audio about 0.16% fast). */
+  const double audio_frames_per_video_frame = 32040.0 / 60.098811862;
+  double audio_frame_accumulator = 0.0;
+  unsigned long long audio_rendered_frames = 0;
+  uint64_t audio_fnv1a = UINT64_C(14695981039346656037);
+  FILE *audio_pcm = NULL;
+  const char *audio_pcm_path = getenv("DKC2_AUDIO_PCM");
+  if (audio_pcm_path && *audio_pcm_path) {
+    audio_pcm = fopen(audio_pcm_path, "wb");
+    if (!audio_pcm) {
+      fprintf(stderr, "unable to open private audio output: %s\n",
+              audio_pcm_path);
+      free(rom);
+      return 10;
+    }
+  }
+  unsigned long video_active_frames = 0;
+  unsigned long blank_frames = 0;
+  unsigned long consecutive_blank_frames = 0;
+  unsigned long max_consecutive_blank_frames = 0;
+  unsigned long audio_active_frames = 0;
+  unsigned long audio_silent_frames = 0;
+  unsigned long long audio_nonzero_samples = 0;
+  unsigned long long audio_clipped_samples = 0;
+  unsigned long long audio_zero_frames = 0;
+  unsigned long long consecutive_audio_zero_frames = 0;
+  unsigned long long max_consecutive_audio_zero_frames = 0;
+  unsigned audio_peak = 0;
+  unsigned audio_max_delta = 0;
+  int previous_audio_samples[2] = { 0, 0 };
+  int audio_sample_history_initialized = 0;
+  int state_initialized = 0;
+  uint16_t previous_game_mode = 0;
+  uint16_t previous_demo_status = 0;
+  uint16_t previous_demo_sequence = 0;
+  uint16_t previous_level = 0;
+  uint16_t previous_game_sub_mode = 0;
+  unsigned title_entries = 0;
+  unsigned demo_starts = 0;
+  unsigned demo_ends = 0;
+  unsigned attract_cycles = 0;
+  unsigned attract_sequence_errors = 0;
+  enum { kPiratePanicLevel = 0x0003 };
+  int pirate_panic_entered = 0;
+  long pirate_panic_first_frame = -1;
+  unsigned long pirate_panic_active_frames = 0;
+  unsigned pirate_panic_completion_flag_changes = 0;
+  unsigned pirate_panic_exit_transitions = 0;
+  uint16_t pirate_panic_entry_flags = 0;
+  uint16_t pirate_panic_entry_flags_2 = 0;
+  uint16_t previous_level_destination = 0;
+  uint16_t previous_game_state_flags = 0;
+  uint16_t previous_game_state_flags_2 = 0;
+  enum { kStateEventSize = 54, kMaxStateEvents = 128 };
+  uint8_t state_event_bytes[kStateEventSize * kMaxStateEvents];
+  size_t state_event_count = 0;
+  const char *state_trace_text = getenv("DKC2_STATE_TRACE");
+  const int emit_state_trace =
+      state_trace_text && *state_trace_text && *state_trace_text != '0';
+  Dkc2InputPlayback input_playback = {0};
+  {
+    const char *p = getenv("SNESRECOMP_INPUT_PLAY");
+    if (p && p[0]) {
+      char error[192];
+      if (!Dkc2InputPlaybackLoad(p, &input_playback, error, sizeof error)) {
+        fprintf(stderr, "input_play: %s: %s\n", p, error);
+        if (audio_pcm) fclose(audio_pcm);
+        free(rom);
+        return 17;
+      }
+      fprintf(stderr, "input_play: loaded %zu frames from %s\n",
+              input_playback.count, p);
+    }
+  }
+  /* DKC2_SAVESTATE_RELOAD_FRAMES=a,b,...: at those host frames reload the
+   * input savestate instead of running the console, then draw, exactly as
+   * the desktop app's rewind restores a snapshot and draws without running
+   * a frame. Reproduces what the first drawn frame after a restore shows. */
+  const char *reload_frames = getenv("DKC2_SAVESTATE_RELOAD_FRAMES");
+  /* DKC2_REWIND_REPLAY=<interval>: keep an in-memory snapshot every
+   * <interval> host frames of the forward run, as the desktop app's rewind
+   * history does, then after the last frame pop them newest first,
+   * restore each and draw without running a console frame, as the app's
+   * rewind does, writing the frames with DKC2_FRAME_PPM_PREFIX and an "r"
+   * suffix under the host frame they were captured at. A rewound frame
+   * that differs from the forward frame of the same state shows what the
+   * presentation keeps across a restore that it should not. */
+  const long rewind_interval = getenv("DKC2_REWIND_REPLAY")
+                                   ? strtol(getenv("DKC2_REWIND_REPLAY"),
+                                            NULL, 10)
+                                   : 0;
+  const size_t rewind_size =
+      rewind_interval > 0 ? RtlSaveSnapshotToMemory(NULL, 0) : 0;
+  uint8_t *rewind_store = NULL;
+  long *rewind_frames = NULL;
+  size_t rewind_count = 0, rewind_capacity = 0;
+  if (rewind_size) {
+    rewind_capacity = (size_t)(frame_limit / rewind_interval + 2);
+    rewind_store = (uint8_t *)malloc(rewind_size * rewind_capacity);
+    rewind_frames = (long *)malloc(sizeof(long) * rewind_capacity);
+  }
+  for (long frame = 0; frame < frame_limit; frame++) {
+    uint32_t _in = Dkc2InputPlaybackFrame(&input_playback, (size_t)frame);
+    bool reloaded = false;
+    if (reload_frames && *reload_frames && savestate_input &&
+        *savestate_input) {
+      const char *cursor = reload_frames;
+      while (*cursor) {
+        char *end = NULL;
+        const long at = strtol(cursor, &end, 10);
+        if (end == cursor)
+          break;
+        if (at == frame) {
+          if (!RtlLoadSnapshot(savestate_input)) {
+            fprintf(stderr, "unable to reload savestate at frame %ld\n",
+                    frame);
+            free(rom);
+            return 14;
+          }
+          reloaded = true;
+          break;
+        }
+        cursor = *end == ',' ? end + 1 : end;
+      }
+    }
+    if (!reloaded)
+      RtlRunFrame(_in);
+    if (rewind_store && rewind_frames && frame % rewind_interval == 0 &&
+        rewind_count < rewind_capacity &&
+        RtlSaveSnapshotToMemory(rewind_store + rewind_count * rewind_size,
+                                rewind_size) == rewind_size) {
+      rewind_frames[rewind_count] = frame;
+      rewind_count++;
+    }
+    if (g_fail) {
+      fprintf(stderr,
+              "snesrecomp reported an off-rails runtime failure at host "
+              "frame %ld resume=$%06x\n",
+              frame, (unsigned)Dkc2ResumePc());
+      if (audio_pcm) fclose(audio_pcm);
+      Dkc2InputPlaybackFree(&input_playback);
+      free(rom);
+      return 6;
+    }
+    if (!Dkc2LastLleResult()) {
+      uint8_t aram_hash[32];
+      sha256_compute(g_snes->apu->ram, sizeof g_snes->apu->ram, aram_hash);
+      fprintf(stderr,
+              "LLE stopped at host frame %ld resume=$%06x x=$%04x "
+              "upload=%02x:%02x%02x target=$%02x%02x words=$%02x%02x "
+              "transaction=$%02x "
+              "apu_in=%02x%02x%02x%02x apu_out=%02x%02x%02x%02x "
+              "spc_pc=$%04x spc_a=$%02x spc_x=$%02x spc_y=$%02x "
+              "ipl=%d\n",
+              frame, (unsigned)Dkc2ResumePc(), g_cpu.X,
+              g_ram[0x34], g_ram[0x33], g_ram[0x32],
+              g_ram[0x36], g_ram[0x35], g_ram[0x38], g_ram[0x37],
+              g_ram[0x00],
+              g_snes->apu->inPorts[3], g_snes->apu->inPorts[2],
+              g_snes->apu->inPorts[1], g_snes->apu->inPorts[0],
+              g_snes->apu->outPorts[3], g_snes->apu->outPorts[2],
+              g_snes->apu->outPorts[1], g_snes->apu->outPorts[0],
+              g_snes->apu->spc->pc, g_snes->apu->spc->a,
+              g_snes->apu->spc->x, g_snes->apu->spc->y,
+              g_snes->apu->romReadable ? 1 : 0);
+      fprintf(stderr, "aram_sha256=");
+      PrintHash(stderr, aram_hash);
+      fprintf(stderr, "\n");
+      if (audio_pcm) fclose(audio_pcm);
+      Dkc2InputPlaybackFree(&input_playback);
+      free(rom);
+      return 5;
+    }
+    /* DKC2_DRAW_EVERY=<n>: draw only every nth host frame, as the desktop
+     * app's fast-forward runs several console frames per drawn frame. The
+     * undrawn frames still write VRAM; what the next drawn frame makes of
+     * those writes is what fast-forward shows. */
+    {
+      static long draw_every = -1;
+      if (draw_every < 0) {
+        const char *value = getenv("DKC2_DRAW_EVERY");
+        draw_every = value && *value ? strtol(value, NULL, 10) : 1;
+        if (draw_every < 1)
+          draw_every = 1;
+      }
+      if (frame % draw_every != 0)
+        continue;
+    }
+    Dkc2DrawPpuFrame();
+    if (WidescreenTraceEnabled() && frame >= WidescreenTraceStart() &&
+        (frame - WidescreenTraceStart()) % WidescreenTraceStep() == 0) {
+      EmitWidescreenFrameTrace(frame);
+    }
+    if (frame_sequence_prefix && *frame_sequence_prefix &&
+        frame >= frame_sequence_start && frame <= frame_sequence_end &&
+        (frame - frame_sequence_start) % frame_sequence_step == 0) {
+      char path[1024];
+      int length = snprintf(path, sizeof path, "%s_%06ld.ppm",
+                            frame_sequence_prefix, frame);
+      if (length < 0 || (size_t)length >= sizeof path ||
+          !WriteFramePpm(path, pixels, frame_width, kHeight,
+                         frame_width * kBytesPerPixel)) {
+        fprintf(stderr, "unable to write private frame sequence at %ld\n",
+                frame);
+        if (audio_pcm) fclose(audio_pcm);
+        Dkc2InputPlaybackFree(&input_playback);
+        free(rom);
+        return 18;
+      }
+    }
+
+    /* Stable gameplay-state telemetry for attract-mode validation. These
+     * addresses are metadata from the independently rebuilt v1.0 map; no ROM
+     * or extracted payload is embedded here. Emit only transitions so a long
+     * neutral-input run remains small and reproducible. */
+    uint16_t game_mode = ReadWram16(0x24);
+    uint16_t demo_status = ReadWram16(0x05fb);
+    uint16_t demo_sequence = ReadWram16(0x0605);
+    uint16_t level = ReadWram16(0x00d3);
+    uint16_t game_sub_mode = ReadWram16(0x0096);
+    uint16_t parent_level = ReadWram16(0x08a8);
+    uint16_t level_destination = ReadWram16(0x059d);
+    uint16_t game_state_flags = ReadWram16(0x08c2);
+    uint16_t game_state_flags_2 = ReadWram16(0x08c4);
+    int pirate_panic_active =
+        demo_status == 0 &&
+        (level == kPiratePanicLevel || parent_level == kPiratePanicLevel);
+    if (pirate_panic_active) {
+      pirate_panic_active_frames++;
+      if (!pirate_panic_entered) {
+        pirate_panic_entered = 1;
+        pirate_panic_first_frame = frame + 1;
+        pirate_panic_entry_flags = game_state_flags;
+        pirate_panic_entry_flags_2 = game_state_flags_2;
+      } else if ((game_state_flags != previous_game_state_flags ||
+                  game_state_flags_2 != previous_game_state_flags_2) &&
+                 (game_state_flags != pirate_panic_entry_flags ||
+                  game_state_flags_2 != pirate_panic_entry_flags_2)) {
+        pirate_panic_completion_flag_changes++;
+      }
+      if (previous_level_destination == 0 && level_destination != 0)
+        pirate_panic_exit_transitions++;
+    }
+    int state_changed = !state_initialized ||
+                        game_mode != previous_game_mode ||
+                        demo_status != previous_demo_status ||
+                        demo_sequence != previous_demo_sequence ||
+                        level != previous_level ||
+                        game_sub_mode != previous_game_sub_mode;
+    if (state_initialized) {
+      if (game_mode != previous_game_mode && game_mode == 0xb397)
+        title_entries++;
+      if (previous_demo_status == 0 && demo_status != 0 &&
+          game_mode == 0x87e1) {
+        static const uint16_t kExpectedDemoLevels[3] = {
+          0x000c, 0x000f, 0x0013
+        };
+        demo_starts++;
+        unsigned expected = (demo_starts - 1) % 3;
+        if (demo_sequence != expected + 1 ||
+            level != kExpectedDemoLevels[expected])
+          attract_sequence_errors++;
+      }
+      if (previous_demo_status != 0 && demo_status == 0 &&
+          previous_game_mode == 0x8819)
+        demo_ends++;
+      if (previous_demo_sequence == 3 && demo_sequence == 0 &&
+          demo_status == 0)
+        attract_cycles++;
+    }
+    if (state_changed && state_event_count < kMaxStateEvents) {
+      uint8_t *event = state_event_bytes +
+                       state_event_count * kStateEventSize;
+      uint8_t *cursor = event;
+      uint8_t event_frame_hash[32];
+      StoreLe32(&cursor, (uint32_t)(frame + 1));
+      StoreLe16(&cursor, game_mode);
+      StoreLe16(&cursor, game_sub_mode);
+      StoreLe16(&cursor, demo_status);
+      StoreLe16(&cursor, demo_sequence);
+      StoreLe16(&cursor, ReadWram16(0x05fd));
+      StoreLe16(&cursor, ReadWram16(0x05ff));
+      StoreLe16(&cursor, level);
+      StoreLe16(&cursor, ReadWram16(0x002a));
+      StoreLe16(&cursor, ReadWram16(0x0020));
+      sha256_compute(pixels, frame_bytes, event_frame_hash);
+      memcpy(cursor, event_frame_hash, sizeof event_frame_hash);
+      state_event_count++;
+    }
+    if (state_changed && emit_state_trace) {
+      fprintf(stderr,
+              "state_event frame=%ld game_mode=$%04x "
+              "game_sub_mode=$%04x demo_status=$%04x "
+              "demo_sequence=$%04x demo_index=$%04x demo_timer=$%04x "
+              "level=$%04x active_frame=$%04x continuation=$%04x\n",
+              frame + 1, game_mode, game_sub_mode, demo_status,
+              demo_sequence, ReadWram16(0x05fd), ReadWram16(0x05ff),
+              level, ReadWram16(0x002a), ReadWram16(0x0020));
+    }
+    previous_game_mode = game_mode;
+    previous_demo_status = demo_status;
+    previous_demo_sequence = demo_sequence;
+    previous_level = level;
+    previous_game_sub_mode = game_sub_mode;
+    previous_level_destination = level_destination;
+    previous_game_state_flags = game_state_flags;
+    previous_game_state_flags_2 = game_state_flags_2;
+    state_initialized = 1;
+
+    int frame_active = 0;
+    for (size_t i = 0; i < frame_bytes; i++) {
+      if (pixels[i] != 0) {
+        frame_active = 1;
+        break;
+      }
+    }
+    if (frame_active) {
+      video_active_frames++;
+      consecutive_blank_frames = 0;
+    } else {
+      blank_frames++;
+      consecutive_blank_frames++;
+      if (consecutive_blank_frames > max_consecutive_blank_frames)
+        max_consecutive_blank_frames = consecutive_blank_frames;
+    }
+
+    audio_frame_accumulator += audio_frames_per_video_frame;
+    int audio_frames_this_frame = (int)audio_frame_accumulator;
+    audio_frame_accumulator -= audio_frames_this_frame;
+    if (audio_frames_this_frame < 0 ||
+        audio_frames_this_frame > kMaximumAudioFramesPerVideoFrame) {
+      fprintf(stderr, "invalid audio frame request: %d\n",
+              audio_frames_this_frame);
+      if (audio_pcm) fclose(audio_pcm);
+      Dkc2InputPlaybackFree(&input_playback);
+      free(rom);
+      return 11;
+    }
+    size_t audio_samples_this_frame =
+        (size_t)audio_frames_this_frame * 2u;
+    memset(audio, 0, audio_samples_this_frame * sizeof audio[0]);
+    RtlRenderAudio(audio, audio_frames_this_frame, 2);
+    audio_rendered_frames += (unsigned)audio_frames_this_frame;
+    int audio_active = 0;
+    for (size_t i = 0; i < audio_samples_this_frame; i++) {
+      int sample = audio[i];
+      unsigned magnitude = (unsigned)(sample < 0 ? -sample : sample);
+      unsigned channel = (unsigned)(i & 1u);
+      if (magnitude != 0) {
+        audio_active = 1;
+        audio_nonzero_samples++;
+        if (magnitude > audio_peak) audio_peak = magnitude;
+      }
+      if (magnitude >= 32760u) audio_clipped_samples++;
+      if (audio_sample_history_initialized) {
+        int delta = sample - previous_audio_samples[channel];
+        unsigned delta_magnitude = (unsigned)(delta < 0 ? -delta : delta);
+        if (delta_magnitude > audio_max_delta)
+          audio_max_delta = delta_magnitude;
+      }
+      previous_audio_samples[channel] = sample;
+      if (channel == 1) audio_sample_history_initialized = 1;
+      audio_fnv1a ^= (uint8_t)(sample & 0xff);
+      audio_fnv1a *= UINT64_C(1099511628211);
+      audio_fnv1a ^= (uint8_t)(((uint16_t)sample >> 8) & 0xff);
+      audio_fnv1a *= UINT64_C(1099511628211);
+    }
+    for (int i = 0; i < audio_frames_this_frame; i++) {
+      if (audio[i * 2] == 0 && audio[i * 2 + 1] == 0) {
+        audio_zero_frames++;
+        consecutive_audio_zero_frames++;
+        if (consecutive_audio_zero_frames >
+            max_consecutive_audio_zero_frames) {
+          max_consecutive_audio_zero_frames =
+              consecutive_audio_zero_frames;
+        }
+      } else {
+        consecutive_audio_zero_frames = 0;
+      }
+    }
+    if (audio_pcm &&
+        fwrite(audio, sizeof audio[0], audio_samples_this_frame, audio_pcm) !=
+            audio_samples_this_frame) {
+      fprintf(stderr, "unable to write private audio output: %s\n",
+              audio_pcm_path);
+      fclose(audio_pcm);
+      Dkc2InputPlaybackFree(&input_playback);
+      free(rom);
+      return 12;
+    }
+    if (audio_active)
+      audio_active_frames++;
+    else
+      audio_silent_frames++;
+  }
+
+  if (audio_pcm && fclose(audio_pcm) != 0) {
+    fprintf(stderr, "unable to close private audio output: %s\n",
+            audio_pcm_path);
+    free(rom);
+    Dkc2InputPlaybackFree(&input_playback);
+    return 13;
+  }
+  audio_pcm = NULL;
+
+  uint8_t frame_hash[32];
+  uint8_t wram_hash[32];
+  uint8_t vram_hash[32];
+  uint8_t cgram_hash[32];
+  uint8_t oam_hash[32];
+  uint8_t oam_source_hash[32];
+  uint8_t state_event_hash[32];
+  uint8_t oam_bytes[544];
+  unsigned bg_pixels = 0;
+  unsigned vram_words = 0;
+  unsigned cgram_words = 0;
+  for (size_t i = 0; i < sizeof g_ppu->vram / sizeof g_ppu->vram[0]; i++)
+    if (g_ppu->vram[i] != 0) vram_words++;
+  for (size_t i = 0; i < sizeof g_ppu->cgram / sizeof g_ppu->cgram[0]; i++)
+    if (g_ppu->cgram[i] != 0) cgram_words++;
+  for (size_t i = 0; i < 256; i++)
+    if ((g_ppu->bgBuffers[0].data[i + kPpuExtraLeftRight] & 0xff) != 0)
+      bg_pixels++;
+  sha256_compute(pixels, frame_bytes, frame_hash);
+  sha256_compute(g_ram, 0x20000, wram_hash);
+  sha256_compute((const uint8_t *)g_ppu->vram, sizeof g_ppu->vram, vram_hash);
+  sha256_compute((const uint8_t *)g_ppu->cgram, sizeof g_ppu->cgram, cgram_hash);
+  memcpy(oam_bytes, g_ppu->oam, sizeof g_ppu->oam);
+  memcpy(oam_bytes + sizeof g_ppu->oam, g_ppu->highOam,
+         sizeof g_ppu->highOam);
+  sha256_compute(oam_bytes, sizeof oam_bytes, oam_hash);
+  /* DKC2 builds its complete low/high OAM image at WRAM $0200-$041f and
+   * transfers all 544 bytes to $2104 during VBlank. Keeping both hashes in
+   * the private integration output distinguishes bad game logic/source data
+   * from a stale PPU OAM-port destination. */
+  sha256_compute(g_ram + 0x200, sizeof oam_bytes, oam_source_hash);
+  sha256_compute(state_event_bytes, state_event_count * kStateEventSize,
+                 state_event_hash);
+  printf("video_state inidisp=$%02x bgmode=$%02x main=$%02x sub=$%02x "
+         "nmi=%d in_nmi=%d frame_counter=%d bg_pixels=%u "
+         "vram_words=%u cgram_words=%u brightness31=%u "
+         "continuation=$%04x intro_state=$%04x terrain_ready=%d "
+         "banana_right=$%04x banana_span=$%04x\n",
+         g_ppu->inidisp, g_ppu->bgmode, g_ppu->screenEnabled[0],
+         g_ppu->screenEnabled[1], g_snes->nmiEnabled ? 1 : 0,
+         g_snes->inNmi ? 1 : 0, snes_frame_counter, bg_pixels,
+         vram_words, cgram_words, g_ppu->brightnessMult[31],
+         (unsigned)(g_ram[0x20] | ((unsigned)g_ram[0x21] << 8)),
+         (unsigned)(g_ram[0x2a] | ((unsigned)g_ram[0x2b] << 8)),
+         Dkc2VideoTerrainReady() ? 1 : 0,
+         Dkc2VideoExpandCullLeft(0x0100),
+         Dkc2VideoExpandCullSpan(0x010f));
+  printf("frame_sha256=");
+  PrintHash(stdout, frame_hash);
+  printf("\nwram_sha256=");
+  PrintHash(stdout, wram_hash);
+  printf("\nvram_sha256=");
+  PrintHash(stdout, vram_hash);
+  printf("\ncgram_sha256=");
+  PrintHash(stdout, cgram_hash);
+  printf("\noam_sha256=");
+  PrintHash(stdout, oam_hash);
+  printf("\noam_source_sha256=");
+  PrintHash(stdout, oam_source_hash);
+  printf("\nstate_event_sha256=");
+  PrintHash(stdout, state_event_hash);
+  printf("\nrun_stats video_active_frames=%lu blank_frames=%lu "
+         "max_consecutive_blank_frames=%lu audio_active_frames=%lu "
+         "audio_silent_frames=%lu audio_frames=%llu "
+         "audio_nonzero_samples=%llu audio_zero_frames=%llu "
+         "max_consecutive_audio_zero_frames=%llu "
+         "audio_clipped_samples=%llu audio_peak=%u audio_max_delta=%u "
+         "audio_fnv1a=%016llx",
+         video_active_frames, blank_frames, max_consecutive_blank_frames,
+         audio_active_frames, audio_silent_frames, audio_rendered_frames,
+         audio_nonzero_samples, audio_zero_frames,
+         max_consecutive_audio_zero_frames, audio_clipped_samples, audio_peak,
+         audio_max_delta,
+         (unsigned long long)audio_fnv1a);
+  printf("\nstate_stats events=%zu title_entries=%u demo_starts=%u "
+         "demo_ends=%u attract_cycles=%u sequence_errors=%u "
+         "demo_status=$%04x demo_sequence=$%04x level=$%04x",
+         state_event_count, title_entries, demo_starts, demo_ends,
+         attract_cycles, attract_sequence_errors, ReadWram16(0x05fb),
+         ReadWram16(0x0605), ReadWram16(0x00d3));
+  printf("\npirate_panic_stats entered=%d first_frame=%ld active_frames=%lu "
+         "completion_flag_changes=%u exit_transitions=%u "
+         "parent_level=$%04x level_destination=$%04x "
+         "game_state_flags=$%04x game_state_flags_2=$%04x",
+         pirate_panic_entered, pirate_panic_first_frame,
+         pirate_panic_active_frames, pirate_panic_completion_flag_changes,
+         pirate_panic_exit_transitions, ReadWram16(0x08a8),
+         ReadWram16(0x059d), ReadWram16(0x08c2), ReadWram16(0x08c4));
+  const char *frame_output = getenv("DKC2_FRAME_PPM");
+  if (rewind_store && rewind_frames && frame_sequence_prefix &&
+      *frame_sequence_prefix) {
+    for (size_t index = rewind_count; index-- > 0;) {
+      if (!RtlLoadSnapshotFromMemory(rewind_store + index * rewind_size,
+                                     rewind_size)) {
+        fprintf(stderr, "rewind replay restore failed at index %zu\n", index);
+        break;
+      }
+      Dkc2DrawPpuFrame();
+      if (WidescreenTraceEnabled())
+        EmitWidescreenFrameTrace(rewind_frames[index]);
+      char path[1024];
+      int length = snprintf(path, sizeof path, "%s_%06ldr.ppm",
+                            frame_sequence_prefix, rewind_frames[index]);
+      if (length < 0 || (size_t)length >= sizeof path ||
+          !WriteFramePpm(path, pixels, frame_width, kHeight,
+                         frame_width * kBytesPerPixel)) {
+        fprintf(stderr, "unable to write rewind replay frame %ld\n",
+                rewind_frames[index]);
+        break;
+      }
+    }
+  }
+  free(rewind_store);
+  free(rewind_frames);
+  if (frame_output && *frame_output) {
+    if (!WriteFramePpm(frame_output, pixels, frame_width, kHeight,
+                       frame_width * kBytesPerPixel)) {
+      fprintf(stderr, "\nunable to write private frame output: %s\n",
+              frame_output);
+      Dkc2InputPlaybackFree(&input_playback);
+      free(rom);
+      return 7;
+    }
+    printf("\nframe_output=%s", frame_output);
+  }
+  const char *oam_output = getenv("DKC2_OAM_OUTPUT");
+  if (oam_output && *oam_output) {
+    FILE *stream = fopen(oam_output, "wb");
+    int oam_ok = stream && fwrite(oam_bytes, 1, sizeof oam_bytes, stream) ==
+                               sizeof oam_bytes;
+    if (stream && fclose(stream) != 0) oam_ok = 0;
+    if (!oam_ok) {
+      fprintf(stderr, "\nunable to write private OAM output: %s\n",
+              oam_output);
+      Dkc2InputPlaybackFree(&input_playback);
+      free(rom);
+      return 8;
+    }
+    printf("\noam_output=%s", oam_output);
+  }
+  const char *wram_output = getenv("DKC2_WRAM_OUTPUT");
+  if (wram_output && *wram_output) {
+    FILE *stream = fopen(wram_output, "wb");
+    int wram_ok = stream && fwrite(g_ram, 1, 0x20000, stream) == 0x20000;
+    if (stream && fclose(stream) != 0) wram_ok = 0;
+    if (!wram_ok) {
+      fprintf(stderr, "\nunable to write private WRAM output: %s\n",
+              wram_output);
+      Dkc2InputPlaybackFree(&input_playback);
+      free(rom);
+      return 9;
+    }
+    printf("\nwram_output=%s", wram_output);
+  }
+  const char *vram_output = getenv("DKC2_VRAM_OUTPUT");
+  if (vram_output && *vram_output) {
+    FILE *stream = fopen(vram_output, "wb");
+    size_t vbytes = sizeof g_ppu->vram;
+    int vram_ok = stream && fwrite(g_ppu->vram, 1, vbytes, stream) == vbytes;
+    if (stream && fclose(stream) != 0) vram_ok = 0;
+    if (!vram_ok) {
+      fprintf(stderr, "\nunable to write private VRAM output: %s\n",
+              vram_output);
+      Dkc2InputPlaybackFree(&input_playback);
+      free(rom);
+      return 9;
+    }
+    printf("\nvram_output=%s", vram_output);
+  }
+  const char *machine_output = getenv("DKC2_MACHINE_OUTPUT");
+  if (machine_output && *machine_output) {
+    uint64_t produced = 0, consumed = 0;
+    audio_trace_sample_clocks(&produced, &consumed);
+    FILE *stream = fopen(machine_output, "wb");
+    int machine_ok = stream && fprintf(
+        stream,
+        "{\n"
+        "  \"frame\": %d, \"resume_pc\": \"%06X\",\n"
+        "  \"cpu\": {\"a\": \"%04X\", \"x\": \"%04X\", "
+        "\"y\": \"%04X\", \"s\": \"%04X\", \"d\": \"%04X\", "
+        "\"db\": \"%02X\", \"pb\": \"%02X\", \"p\": \"%02X\", "
+        "\"m\": %u, \"xf\": %u, \"cycles\": %llu, "
+        "\"master_cycles\": %llu},\n"
+        "  \"apu\": {\"cycles\": %u, \"rom_readable\": %s, "
+        "\"in\": [\"%02X\", \"%02X\", \"%02X\", \"%02X\"], "
+        "\"out\": [\"%02X\", \"%02X\", \"%02X\", \"%02X\"], "
+        "\"queue_head\": %u, \"queue_tail\": %u, "
+        "\"produced\": %llu, \"consumed\": %llu},\n"
+        "  \"spc\": {\"pc\": \"%04X\", \"a\": \"%02X\", "
+        "\"x\": \"%02X\", \"y\": \"%02X\", \"sp\": \"%02X\", "
+        "\"stopped\": %s}\n"
+        "}\n",
+        snes_frame_counter, (unsigned)Dkc2ResumePc(), g_cpu.A, g_cpu.X,
+        g_cpu.Y, g_cpu.S, g_cpu.D, g_cpu.DB, g_cpu.PB, g_cpu.P,
+        (unsigned)g_cpu.m_flag, (unsigned)g_cpu.x_flag,
+        (unsigned long long)g_cpu.cycles,
+        (unsigned long long)g_cpu.master_cycles, g_snes->apu->cycles,
+        g_snes->apu->romReadable ? "true" : "false",
+        g_snes->apu->inPorts[0], g_snes->apu->inPorts[1],
+        g_snes->apu->inPorts[2], g_snes->apu->inPorts[3],
+        g_snes->apu->outPorts[0], g_snes->apu->outPorts[1],
+        g_snes->apu->outPorts[2], g_snes->apu->outPorts[3],
+        g_snes->apu->portQHead, g_snes->apu->portQTail,
+        (unsigned long long)produced, (unsigned long long)consumed,
+        g_snes->apu->spc->pc, g_snes->apu->spc->a,
+        g_snes->apu->spc->x, g_snes->apu->spc->y,
+        g_snes->apu->spc->sp,
+        g_snes->apu->spc->stopped ? "true" : "false") > 0;
+    if (stream && fclose(stream) != 0) machine_ok = 0;
+    if (!machine_ok) {
+      fprintf(stderr, "\nunable to write private machine output: %s\n",
+              machine_output);
+      Dkc2InputPlaybackFree(&input_playback);
+      free(rom);
+      return 16;
+    }
+  }
+  if (audio_pcm_path && *audio_pcm_path) {
+    printf("\naudio_output=%s", audio_pcm_path);
+  }
+  printf("\nresult=completed frames=%ld\n", frame_limit);
+#if SNESRECOMP_TRACE
+  /* Developer-only post-run inspection boundary. The emulation workload is
+   * already complete and every always-on ring is stable; TCP `continue`
+   * releases the host to exit after clients finish querying history. */
+  {
+    const char *hold = getenv("SNESRECOMP_TRACE_HOLD");
+    if (hold && *hold && *hold != '0') {
+      fflush(stdout);
+      debug_server_start_paused();
+      debug_server_wait_if_paused();
+    }
+  }
+#endif
+  free(rom);
+  Dkc2InputPlaybackFree(&input_playback);
+  return 0;
+}

@@ -1,0 +1,27 @@
+# Private ROM-derived artifacts (never commit per AGENTS.md)
+/generated/
+roms/
+*.sfc
+*.smc
+*.fig
+*.swc
+*.sav
+*.srm
+
+# Android build outputs
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+android/.idea/
+*.iml
+android/.project
+
+# Host builds
+build/
+build-*/
+
+# Logs and temporaries
+*.log
+gen_aot*.log

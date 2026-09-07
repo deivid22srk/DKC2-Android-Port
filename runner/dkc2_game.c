@@ -1,0 +1,2362 @@
+#include "dkc2_game.h"
+#include "dkc2_hdma.h"
+#include "dkc2_video.h"
+
+#include "common_cpu_infra.h"
+#include "common_rtl.h"
+#include "cpu_state.h"
+#include "snes/cart.h"
+#include "snes/dma.h"
+#include "snes/interp_bridge.h"
+#include "snes/ppu.h"
+#include "snes/saveload.h"
+#include "snes/snes.h"
+#include "snes/ws_shadow.h"
+
+#include <stdbool.h>
+#include <string.h>
+
+enum {
+  kDkc2ResetPc = 0x0083F7,
+  kDkc2NmiPc = 0x00F37D,
+};
+
+static bool s_cpu_initialized;
+static uint32_t s_resume_pc = kDkc2ResetPc;
+static int s_last_lle_result = 1;
+static uint64_t s_next_frame_master;
+static bool s_widescreen_shadow_active;
+static uint32_t s_widescreen_world_x[2];
+static uint32_t s_widescreen_world_y[2];
+static bool s_widescreen_source_valid;
+static uint64_t s_widescreen_source_signature;
+static Dkc2TerrainPrefillStats s_terrain_prefill_stats;
+
+/* Per-frame scanline geometry read from the cartridge's own HDMA tables and
+ * the presentation policy chosen for each (wide layer, band). A band is
+ * served from the world-keyed terrain store (the layer displays the
+ * streamed level map at the terrain phase), presented from its own map's
+ * hardware wrap (a static, fully authored 64-column plane the cartridge
+ * never streams), or repeats its rendered native scanline (a bounded
+ * effect or a backdrop the cartridge keeps streaming). */
+/* The cartridge's NMI sub-mode ($96) while a level-name card is shown. */
+enum { kDkc2NameCardNmiSubMode = 11 };
+
+enum {
+  kDkc2BandPolicyRepeat = 0,
+  kDkc2BandPolicyWorld = 1,
+  kDkc2BandPolicyPlane = 2,
+};
+static Dkc2HdmaBands s_frame_bands;
+static uint8_t s_band_policy[2][kDkc2HdmaMaxBands];
+/* The terrain layer's rendered scroll phase for the frame
+ * (Dkc2VideoSelectTerrainPhase): the key for the world store, the prefill's
+ * source rows, and the band classification. */
+static uint16_t s_terrain_phase_h;
+static uint16_t s_terrain_phase_v;
+static bool s_terrain_phase_from_band;
+static int s_plane_band_count[2];
+/* The west hold the last prefill found in the level map (Dkc2VideoHoldWest):
+ * the world x of the authored edge the player is held at, and the
+ * presented bias, which moves at most one pixel per frame toward the
+ * glide's target so a hold that appears or vanishes never snaps the
+ * picture. Both reset with the world store. */
+static bool s_hold_west_valid;
+static uint32_t s_hold_west_x;
+static bool s_bias_valid;
+static int s_bias_presented;
+/* Frames since the presented bias was reset: within the first few the
+ * bias snaps to its target rather than gliding, so a level that starts at
+ * a hold opens already slid, as one that starts at the map's first page
+ * does. */
+enum { kDkc2BiasSettleFrames = 4 };
+static uint32_t s_bias_frames;
+/* The camera of the last prefill, for the hold's entry test: the player
+ * stands within kDkc2HoldPlayerEdge pixels of the frame's west edge while
+ * the camera does not move. The camera leads a walking player by about
+ * sixty pixels, so a player at twenty is one the camera failed to centre:
+ * pinned at the level's edge. The player's world x is at $0A2A. */
+enum { kDkc2HoldPlayerEdge = 40 };
+static bool s_hold_camera_valid;
+static uint32_t s_hold_camera_x;
+/* A level opens with its camera at a bound, so for the first prefill
+ * frames after a level change the hold enters on the void beside the
+ * window alone: a fresh Screech's Sprint spawns Diddy sixty pixels in,
+ * where a free camera would also put him, and the pin would wait for the
+ * player to walk into the edge. A state restore is not a level start
+ * (DKC2_LOAD_AS_LEVEL_START=1 makes the headless runner treat it as one,
+ * to test the start path from a mid-level save). */
+enum { kDkc2HoldStartFrames = 8 };
+static uint32_t s_hold_start_frames;
+static bool s_state_loaded_recently;
+
+int Dkc2GetPlaneBandCount(int layer) {
+  return layer >= 0 && layer < 2 ? s_plane_band_count[layer] : 0;
+}
+
+/*
+ * Static tilemap planes. A 64-column map that is not the terrain stream's
+ * destination is a fully authored plane (Red-Hot Ride's foreground rocks
+ * and far spikes share one such map, swapped between BG1 and BG2 by HDMA)
+ * only if the cartridge never streams it. The engine stamps every VRAM
+ * page with the frame of its last write; a page counts as static once the
+ * camera has traveled kDkc2PlaneTravel pixels from where it stood at that
+ * write (or at the level's first widescreen frame) without another write,
+ * because a ring the cartridge streams for the camera is rewritten well
+ * within that distance. Until then such a band keeps the repeat policy.
+ */
+enum { kDkc2VramPages = 32, kDkc2PlaneTravel = 24 };
+static uint64_t Dkc2LevelSourceSignature(void);
+static bool s_page_signature_valid;
+static uint64_t s_page_signature;
+static uint32_t s_page_write_seen[kDkc2VramPages];
+static int32_t s_page_anchor_x[kDkc2VramPages];
+static int32_t s_page_anchor_y[kDkc2VramPages];
+static bool s_page_traveled[kDkc2VramPages];
+
+/* Cached wrap-authoring verdict per BGnSC value, refreshed when the map's
+ * pages are written, on a level change, and periodically as a guard. */
+typedef struct Dkc2PlaneCacheEntry {
+  bool valid;
+  bool authored;
+  uint64_t broken_rows;   /* Dkc2VideoTilemapBrokenRows, with `authored` */
+  uint16_t character_base; /* the layer's character base the verdict used */
+  uint32_t stamp;
+  uint32_t frame;
+} Dkc2PlaneCacheEntry;
+static Dkc2PlaneCacheEntry s_plane_cache[256];
+static uint32_t s_plane_frame;
+/* Object planes are rewritten as the object animates, so their verdict is
+ * refreshed whenever a page changes (every frame, in practice). */
+static Dkc2PlaneCacheEntry s_object_plane_cache[256];
+
+static void Dkc2TrackVramPages(int32_t camera_x, int32_t camera_y) {
+  const uint64_t signature = Dkc2LevelSourceSignature();
+  const bool reset =
+      !s_page_signature_valid || signature != s_page_signature;
+  s_page_signature = signature;
+  s_page_signature_valid = true;
+  s_plane_frame++;
+  if (reset) {
+    memset(s_plane_cache, 0, sizeof s_plane_cache);
+    memset(s_object_plane_cache, 0, sizeof s_object_plane_cache);
+  }
+  for (unsigned page = 0; page < kDkc2VramPages; page++) {
+    const uint32_t stamp = WsShadowVramPageWriteFrame(page);
+    if (reset) {
+      /* Every non-terrain map in the audited stages is uploaded once at
+       * load and never streamed, so a level starts with its pages counted
+       * as traveled; the first write after that restarts the gate. */
+      s_page_write_seen[page] = stamp;
+      s_page_traveled[page] = true;
+    } else if (stamp != s_page_write_seen[page]) {
+      s_page_write_seen[page] = stamp;
+      s_page_traveled[page] = false;
+      s_page_anchor_x[page] = camera_x;
+      s_page_anchor_y[page] = camera_y;
+    }
+    if (!s_page_traveled[page]) {
+      const int32_t dx = camera_x - s_page_anchor_x[page];
+      const int32_t dy = camera_y - s_page_anchor_y[page];
+      if (dx >= kDkc2PlaneTravel || dx <= -kDkc2PlaneTravel ||
+          dy >= kDkc2PlaneTravel || dy <= -kDkc2PlaneTravel)
+        s_page_traveled[page] = true;
+    }
+  }
+}
+
+static bool Dkc2MapWrapsAuthored(uint8_t bg_sc, uint32_t newest_stamp,
+                                 uint16_t character_base) {
+  Dkc2PlaneCacheEntry *entry = &s_plane_cache[bg_sc];
+  if (!entry->valid || entry->stamp != newest_stamp ||
+      entry->character_base != character_base ||
+      s_plane_frame - entry->frame >= 64u) {
+    entry->valid = true;
+    entry->stamp = newest_stamp;
+    entry->frame = s_plane_frame;
+    entry->character_base = character_base;
+    entry->authored = Dkc2VideoTilemapWrapsAuthored(g_ppu->vram, 0x8000u,
+                                                    bg_sc, character_base);
+    entry->broken_rows = Dkc2VideoTilemapBrokenRows(g_ppu->vram, 0x8000u,
+                                                    bg_sc, character_base);
+  }
+  return entry->authored;
+}
+
+/* The rows a band shows of a map, from its own vertical scroll and its
+ * scanlines, tested against the map's broken rows (a dense painted strip
+ * that stops short of the wrap: see Dkc2VideoTilemapBrokenRows). */
+static bool Dkc2BandShowsBrokenRows(uint8_t bg_sc, uint16_t v_scroll,
+                                    uint8_t first_line, uint8_t last_line) {
+  const Dkc2PlaneCacheEntry *entry = &s_plane_cache[bg_sc];
+  if (!entry->valid || entry->broken_rows == 0)
+    return false;
+  const unsigned rows = (bg_sc & 2u) ? 64u : 32u;
+  const unsigned first = ((unsigned)v_scroll + first_line - 1u) >> 3;
+  const unsigned last = ((unsigned)v_scroll + last_line - 1u) >> 3;
+  for (unsigned row = first; row <= last; row++) {
+    if (entry->broken_rows & ((uint64_t)1 << (row % rows)))
+      return true;
+  }
+  return false;
+}
+
+static bool Dkc2VramPageStatic(unsigned page) {
+  return page < kDkc2VramPages && s_page_traveled[page];
+}
+
+static bool Dkc2MapIsObjectPlane(uint8_t bg_sc, uint32_t newest_stamp,
+                                 uint16_t character_base) {
+  Dkc2PlaneCacheEntry *entry = &s_object_plane_cache[bg_sc];
+  if (!entry->valid || entry->stamp != newest_stamp ||
+      entry->character_base != character_base ||
+      s_plane_frame - entry->frame >= 64u) {
+    entry->valid = true;
+    entry->stamp = newest_stamp;
+    entry->frame = s_plane_frame;
+    entry->character_base = character_base;
+    entry->authored = Dkc2VideoTilemapIsObjectPlane(g_ppu->vram, 0x8000u,
+                                                    bg_sc, character_base);
+  }
+  return entry->authored;
+}
+
+/* A band's map is presented as its own wrap when it is 64 columns wide,
+ * not the terrain stream's destination, and either a static plane (every
+ * page unwritten since the camera last traveled kDkc2PlaneTravel pixels,
+ * content authored to continue across the wrap:
+ * Dkc2VideoTilemapWrapsAuthored, and none of the rows this band shows a
+ * painted strip that stops short of the wrap: Dkc2VideoTilemapBrokenRows;
+ * such a band repeats the ring instead) or an object plane (one page holds a
+ * block the layer's scroll positions, the other is blank:
+ * Dkc2VideoTilemapIsObjectPlane; Haunted Hall's Kackle on BG2). */
+static bool Dkc2BandShowsStaticPlane(uint8_t bg_sc, uint16_t stream_base,
+                                     int layer, uint16_t v_scroll,
+                                     uint8_t first_line, uint8_t last_line) {
+  const uint16_t character_base = (uint16_t)PPU_bgTileAdr(g_ppu, layer);
+  const uint16_t base = (uint16_t)((bg_sc & 0xfcu) << 8);
+  if (!(bg_sc & 1u) || base == stream_base)
+    return false;
+  uint8_t pages[4];
+  const unsigned count = Dkc2VideoTilemapPages(bg_sc, pages);
+  if (count == 0)
+    return false;
+  uint32_t newest = 0;
+  bool all_static = true;
+  for (unsigned index = 0; index < count; index++) {
+    if (!Dkc2VramPageStatic(pages[index]))
+      all_static = false;
+    const uint32_t stamp = WsShadowVramPageWriteFrame(pages[index]);
+    if (stamp > newest)
+      newest = stamp;
+  }
+  if (all_static && Dkc2MapWrapsAuthored(bg_sc, newest, character_base) &&
+      !Dkc2BandShowsBrokenRows(bg_sc, v_scroll, first_line, last_line))
+    return true;
+  return Dkc2MapIsObjectPlane(bg_sc, newest, character_base);
+}
+
+void Dkc2GetTerrainPrefillStats(Dkc2TerrainPrefillStats *out) {
+  if (out)
+    *out = s_terrain_prefill_stats;
+}
+
+int Dkc2GetHdmaBandCount(void) {
+  return s_frame_bands.count;
+}
+
+typedef struct Dkc2HostSnapshot {
+  CpuState cpu;
+  uint32_t resume_pc;
+  uint64_t next_frame_master;
+  uint64_t main_cpu_cycles_estimate;
+  uint64_t apu_pace_cycles_estimate;
+  uint64_t apu_last_sync_cycles;
+  uint64_t apu_last_sync_master;
+  int last_lle_result;
+  int frame_counter;
+  uint8_t cpu_initialized;
+  uint8_t last_hdmaen;
+  uint8_t memsel;
+} Dkc2HostSnapshot;
+
+enum {
+  /* NTSC master clocks per non-short host frame. The shared interpreter
+   * already accounts each opcode and bus region in this unit. A deadline at
+   * this cadence lets VBlank interrupt productive loading/decompression code
+   * instead of atomically running hundreds of console frames to the next WAI. */
+  kDkc2NtscFrameMasterClocks = 1364 * 262,
+};
+
+static void Dkc2RunOneFrame(void) {
+  bool first_frame = !s_cpu_initialized;
+  if (s_next_frame_master == 0) {
+    s_next_frame_master =
+        g_cpu.master_cycles + kDkc2NtscFrameMasterClocks;
+  }
+  while (s_next_frame_master <= g_cpu.master_cycles)
+    s_next_frame_master += kDkc2NtscFrameMasterClocks;
+  interp_bridge_set_master_deadline(s_next_frame_master);
+
+  if (first_frame) {
+    cpu_state_init(&g_cpu, g_ram);
+    s_cpu_initialized = true;
+  }
+  if (!first_frame && g_snes->nmiEnabled) {
+    /* DKC2's boot/intro NMI is a non-returning frame dispatcher. The handler
+     * jumps through the continuation pointer at direct-page $20; that frame
+     * routine resets S and ends at its own WAI rather than executing RTI.
+     * Run the handler and continuation together to the next quiescent wait.
+     * Resuming the pre-NMI WAI afterwards would discard all progress made by
+     * the continuation and leave the palette source buffer permanently zero. */
+    g_snes->inNmi = true;
+    cpu_push_interrupt_frame_at(&g_cpu, s_resume_pc);
+    s_last_lle_result =
+        interp_bridge_run_until_quiescent(&g_cpu, kDkc2NmiPc);
+  } else {
+    s_last_lle_result =
+        interp_bridge_run_until_quiescent(&g_cpu, s_resume_pc);
+  }
+
+  interp_bridge_set_master_deadline(0);
+  s_resume_pc = interp_bridge_lle_resume_pc();
+  if (g_cpu.master_cycles < s_next_frame_master) {
+    g_cpu.master_cycles = s_next_frame_master;
+    snes_sync_master_clock(g_snes, g_cpu.master_cycles);
+  }
+  s_next_frame_master += kDkc2NtscFrameMasterClocks;
+}
+
+static void Dkc2SaveExtra(SaveLoadInfo *sli) {
+  Dkc2HostSnapshot snapshot;
+  memset(&snapshot, 0, sizeof snapshot);
+  snapshot.cpu = g_cpu;
+  snapshot.cpu.ram = NULL;
+  snapshot.resume_pc = s_resume_pc;
+  snapshot.next_frame_master = s_next_frame_master;
+  snapshot.main_cpu_cycles_estimate = g_main_cpu_cycles_estimate;
+  snapshot.apu_pace_cycles_estimate = g_apu_pace_cycles_estimate;
+  snapshot.apu_last_sync_cycles = g_apu_last_sync_cycles;
+  snapshot.apu_last_sync_master = g_apu_last_sync_master;
+  snapshot.last_lle_result = s_last_lle_result;
+  snapshot.frame_counter = snes_frame_counter;
+  snapshot.cpu_initialized = s_cpu_initialized ? 1u : 0u;
+  snapshot.last_hdmaen = g_snesrecomp_last_hdmaen;
+  snapshot.memsel = g_memsel;
+  sli->func(sli, &snapshot, sizeof snapshot);
+}
+
+static void Dkc2LoadExtra(SaveLoadInfo *sli, uint32_t version) {
+  (void)version;
+  Dkc2HostSnapshot snapshot;
+  sli->func(sli, &snapshot, sizeof snapshot);
+  g_cpu = snapshot.cpu;
+  g_cpu.ram = g_ram;
+  s_resume_pc = snapshot.resume_pc;
+  s_next_frame_master = snapshot.next_frame_master;
+  g_main_cpu_cycles_estimate = snapshot.main_cpu_cycles_estimate;
+  g_apu_pace_cycles_estimate = snapshot.apu_pace_cycles_estimate;
+  g_apu_last_sync_cycles = snapshot.apu_last_sync_cycles;
+  g_apu_last_sync_master = snapshot.apu_last_sync_master;
+  s_last_lle_result = snapshot.last_lle_result;
+  snes_frame_counter = snapshot.frame_counter;
+  s_cpu_initialized = snapshot.cpu_initialized != 0;
+  g_snesrecomp_last_hdmaen = snapshot.last_hdmaen;
+  g_memsel = snapshot.memsel;
+}
+
+static void Dkc2OnStateLoaded(uint32_t version) {
+  (void)version;
+  g_cpu.ram = g_ram;
+  g_apu_last_sync_master = g_cpu.master_cycles;
+  g_snes->beamMasterLast = g_cpu.master_cycles;
+  interp_bridge_set_master_deadline(0);
+  WsShadowReset();
+  s_widescreen_shadow_active = false;
+  s_widescreen_source_valid = false;
+  s_hold_west_valid = false;
+  s_hold_camera_valid = false;
+  s_bias_valid = false;
+  s_state_loaded_recently = !getenv("DKC2_LOAD_AS_LEVEL_START");
+  Dkc2VideoSetTerrainReady(false);
+}
+
+static const RtlGameInfo kDkc2GameInfo = {
+  .title = "dkc2",
+  .initialize = NULL,
+  .run_frame = &Dkc2RunOneFrame,
+  .draw_ppu_frame = &Dkc2DrawPpuFrame,
+  .save_name_prefix = "dkc2s",
+  .state_save_extra = &Dkc2SaveExtra,
+  .state_load_extra = &Dkc2LoadExtra,
+  .on_state_loaded = &Dkc2OnStateLoaded,
+};
+
+const RtlGameInfo *Dkc2GameInfo(void) {
+  return &kDkc2GameInfo;
+}
+
+void Dkc2BeginDrawing(uint8_t *pixels, size_t pitch) {
+  PpuBeginDrawing(g_ppu, pixels, pitch, kPpuRenderFlags_NewRenderer);
+}
+
+static uint16_t Dkc2ReadWram16(uint16_t address) {
+  return (uint16_t)g_ram[address] |
+         ((uint16_t)g_ram[(uint16_t)(address + 1u)] << 8);
+}
+
+static void Dkc2ResetWidescreenShadow(void) {
+  if (s_widescreen_shadow_active)
+    WsShadowReset();
+  s_widescreen_shadow_active = false;
+  s_widescreen_source_valid = false;
+  s_hold_west_valid = false;
+  s_hold_camera_valid = false;
+  s_bias_valid = false;
+  Dkc2VideoSetTerrainReady(false);
+}
+
+static const uint8_t *Dkc2LevelSourceBank(uint8_t *bank_out) {
+  const uint8_t bank = g_ram[0x009a];
+  if (bank_out)
+    *bank_out = bank;
+  if (bank == 0x7e)
+    return g_ram;
+  if (bank == 0x7f)
+    return g_ram + 0x10000;
+  return NULL;
+}
+
+static uint64_t Dkc2LevelSourceSignature(void) {
+  const uint64_t bank = g_ram[0x009a];
+  const uint64_t map = Dkc2ReadWram16(0x0098);
+  const uint64_t metatiles = Dkc2ReadWram16(0x17b4);
+  const uint64_t vram = Dkc2ReadWram16(0x17b6);
+  return bank | (map << 8) | (metatiles << 24) | (vram << 40);
+}
+
+static void Dkc2RecordTerrainPrefillTile(int layer,
+                                          uint32_t world_tile_x,
+                                          uint32_t world_tile_y,
+                                          uint16_t expected_entry,
+                                          bool margin) {
+  uint16_t actual = 0;
+  if (!WsShadowLookupWorldTile(
+          layer, world_tile_x, world_tile_y, &actual))
+    return;
+  s_terrain_prefill_stats.present++;
+  if (margin)
+    s_terrain_prefill_stats.margin_present++;
+  if (actual != expected_entry)
+    return;
+  s_terrain_prefill_stats.matching++;
+  if (margin)
+    s_terrain_prefill_stats.margin_matching++;
+}
+
+/* A margin metatile column that is empty for the whole visible height is a
+ * void the console never shows beside a wall (a shaft's far side). An
+ * authored window or doorway is empty for a row or two with wall above and
+ * below in the same column, and must stay open. */
+struct Dkc2MetatileClassifyContext;
+static bool Dkc2MetatileColumnIsVoid(struct Dkc2MetatileClassifyContext *ctx,
+                                     uint32_t metatile_x,
+                                     uint32_t metatile_y, bool east_side,
+                                     uint32_t edge_metatile_x);
+
+/* Metatile fill classifier for the structural wall continuation: decodes
+ * the sixteen tiles of a 32x32 level-map metatile and tests each character
+ * against live VRAM. Results are cached for one prefill pass. */
+enum { kDkc2MetatileCacheWidth = 32, kDkc2MetatileCacheHeight = 16 };
+
+typedef struct Dkc2MetatileClassifyContext {
+  const uint8_t *bank_data;
+  uint16_t map_base;
+  uint16_t metatile_base;
+  Dkc2VideoLevelLayout layout;
+  unsigned row_bytes;             /* row-major maps; 0 = column-major */
+  const uint16_t *vram;
+  uint16_t character_base;
+  uint32_t source_tile_limit_x;
+  uint32_t source_tile_limit_y;   /* 0 = no vertical limit */
+  uint32_t cache_base_x;
+  uint32_t cache_base_y;
+  uint8_t cache[kDkc2MetatileCacheHeight][kDkc2MetatileCacheWidth];
+  /* Visible metatile rows for the void-column test (inclusive). */
+  uint32_t visible_first_y;
+  uint32_t visible_last_y;
+  uint8_t column_void[kDkc2MetatileCacheWidth]; /* 0 unknown, else 1 + rows empty from the top */
+  uint8_t column_wall[kDkc2MetatileCacheWidth]; /* 0 unknown, 1 wall, 2 not */
+} Dkc2MetatileClassifyContext;
+
+/* Decode a level tile with the frame's row stride for row-major maps. */
+static bool Dkc2DecodeLevelTile(const uint8_t *bank_data, uint16_t map_base,
+                                uint16_t metatile_base,
+                                Dkc2VideoLevelLayout layout,
+                                unsigned row_bytes, uint32_t tile_x,
+                                uint32_t tile_y, uint16_t *entry) {
+  if (layout == kDkc2VideoLevelLayoutHorizontal || row_bytes == 0)
+    return Dkc2VideoDecodeLevelTile(bank_data, 0x10000u, map_base,
+                                    metatile_base, layout, tile_x, tile_y,
+                                    entry);
+  return Dkc2VideoDecodeLevelTileRowMajor(bank_data, 0x10000u, map_base,
+                                          metatile_base, row_bytes, tile_x,
+                                          tile_y, entry);
+}
+
+/*
+ * Row stride calibration for row-major level maps. The sub-mode's layout
+ * gives a default stride, but a stage can run a different column builder
+ * than its sub-mode suggests: Bramble $002D (sub-mode $10, the square
+ * scroller's 192-byte rows) stores 80 metatiles per row like a ship hold.
+ * Decoded with the wrong stride, every margin cell is a tile from another
+ * row of the map. Each frame the stride in use is verified against the
+ * fully staged native window (32 columns by 28 rows of the ring); when it
+ * reproduces fewer than kDkc2RowStrideAcceptPercent of those cells, every
+ * candidate stride is tried and the best one above that gate replaces it.
+ * With no candidate above the gate the terrain stays unproven for the
+ * frame, so the margins are black rather than a wrong row of the map.
+ */
+enum { kDkc2RowStrideAcceptPercent = 90 };
+static const unsigned kDkc2RowStrideCandidates[] = {32u, 64u, 96u, 128u,
+                                                    160u, 192u, 224u, 256u};
+static uint64_t s_row_stride_signature;
+static bool s_row_stride_valid;
+static unsigned s_row_bytes;
+
+static unsigned Dkc2RowStrideMatchPercent(
+    const uint8_t *bank_data, uint16_t map_base, uint16_t metatile_base,
+    int terrain_layer, unsigned row_bytes, uint32_t first_source_tile,
+    uint32_t top_source_row, uint32_t ring_top_row) {
+  const uint16_t ring_base =
+      (uint16_t)PPU_bgTilemapAdr(g_ppu, terrain_layer);
+  unsigned matched = 0;
+  unsigned total = 0;
+  for (uint32_t column = 0; column < 32u; column++) {
+    const uint32_t ring_column = (first_source_tile + 32u + column) & 63u;
+    for (uint32_t row = 0; row < 28u; row++) {
+      uint16_t decoded = 0;
+      /* Rows wrap like the prefill's: at the top of a stage the first
+       * viewport row is the guard row above the map (tile row 8191) and
+       * the rows below it start again at zero. */
+      if (!Dkc2VideoDecodeLevelTileRowMajor(
+              bank_data, 0x10000u, map_base, metatile_base, row_bytes,
+              first_source_tile + column,
+              (top_source_row + row) & 0x1fffu, &decoded))
+        continue;
+      const uint16_t word = (uint16_t)(
+          ring_base + ((ring_column & 32u) ? 0x400u : 0u) +
+          (((ring_top_row + row) & 31u) << 5) + (ring_column & 31u));
+      total++;
+      if ((decoded & 0x03ffu) == (g_ppu->vram[word & 0x7fffu] & 0x03ffu))
+        matched++;
+    }
+  }
+  return total ? matched * 100u / total : 0u;
+}
+
+/* Returns the stride to decode with, or 0 when none reproduces the native
+ * window. `percent` receives the match of the stride returned (or of the
+ * default when none passes). */
+static unsigned Dkc2CalibrateRowStride(
+    const uint8_t *bank_data, uint16_t map_base, uint16_t metatile_base,
+    Dkc2VideoLevelLayout layout, int terrain_layer,
+    uint32_t first_source_tile, uint32_t top_source_row,
+    uint32_t ring_top_row, unsigned *percent) {
+  const unsigned default_bytes = Dkc2VideoLevelLayoutRowBytes(layout);
+  const uint64_t signature = Dkc2LevelSourceSignature();
+  if (!s_row_stride_valid || signature != s_row_stride_signature ||
+      s_row_bytes == 0u) {
+    s_row_stride_signature = signature;
+    s_row_stride_valid = true;
+    s_row_bytes = default_bytes;
+  }
+  if (default_bytes == 0u) {
+    *percent = 0u;
+    return 0u;
+  }
+  unsigned current = Dkc2RowStrideMatchPercent(
+      bank_data, map_base, metatile_base, terrain_layer, s_row_bytes,
+      first_source_tile, top_source_row, ring_top_row);
+  if (current >= (unsigned)kDkc2RowStrideAcceptPercent) {
+    *percent = current;
+    return s_row_bytes;
+  }
+  unsigned best_bytes = 0u;
+  unsigned best_percent = 0u;
+  for (size_t index = 0;
+       index < sizeof kDkc2RowStrideCandidates /
+                   sizeof kDkc2RowStrideCandidates[0];
+       index++) {
+    const unsigned candidate = kDkc2RowStrideCandidates[index];
+    const unsigned match = Dkc2RowStrideMatchPercent(
+        bank_data, map_base, metatile_base, terrain_layer, candidate,
+        first_source_tile, top_source_row, ring_top_row);
+    if (match > best_percent) {
+      best_percent = match;
+      best_bytes = candidate;
+    }
+  }
+  if (best_percent >= (unsigned)kDkc2RowStrideAcceptPercent) {
+    s_row_bytes = best_bytes;
+    *percent = best_percent;
+    return best_bytes;
+  }
+  *percent = current;
+  return 0u;
+}
+
+static Dkc2VideoMetatileFill Dkc2ClassifyMetatile(void *context,
+                                                  uint32_t metatile_x,
+                                                  uint32_t metatile_y) {
+  Dkc2MetatileClassifyContext *ctx = (Dkc2MetatileClassifyContext *)context;
+  const bool cached =
+      metatile_x >= ctx->cache_base_x &&
+      metatile_x - ctx->cache_base_x < kDkc2MetatileCacheWidth &&
+      metatile_y >= ctx->cache_base_y &&
+      metatile_y - ctx->cache_base_y < kDkc2MetatileCacheHeight;
+  if (cached) {
+    const uint8_t hit = ctx->cache[metatile_y - ctx->cache_base_y]
+                                  [metatile_x - ctx->cache_base_x];
+    if (hit != 0)
+      return (Dkc2VideoMetatileFill)hit;
+  }
+  Dkc2VideoMetatileFill fill = kDkc2VideoMetatileUnknown;
+  const uint32_t tile_x0 = metatile_x * 4u;
+  const uint32_t tile_y0 = metatile_y * 4u;
+  if (tile_x0 + 4u <= ctx->source_tile_limit_x &&
+      (ctx->source_tile_limit_y == 0 ||
+       tile_y0 + 4u <= ctx->source_tile_limit_y)) {
+    int transparent = 0, decoded = 0;
+    for (uint32_t j = 0; j < 4u; j++) {
+      for (uint32_t i = 0; i < 4u; i++) {
+        uint16_t entry = 0;
+        if (!Dkc2DecodeLevelTile(ctx->bank_data, ctx->map_base,
+                                 ctx->metatile_base, ctx->layout,
+                                 ctx->row_bytes, tile_x0 + i, tile_y0 + j,
+                                 &entry))
+          continue;
+        decoded++;
+        if (Dkc2VideoCharacterIsTransparent(ctx->vram, 0x8000u,
+                                            ctx->character_base, entry))
+          transparent++;
+      }
+    }
+    if (decoded == 16) {
+      fill = transparent == 16 ? kDkc2VideoMetatileEmpty
+             : transparent == 0 ? kDkc2VideoMetatileFull
+                                : kDkc2VideoMetatilePartial;
+    }
+  }
+  if (cached)
+    ctx->cache[metatile_y - ctx->cache_base_y]
+              [metatile_x - ctx->cache_base_x] = (uint8_t)fill;
+  return fill;
+}
+
+static bool Dkc2MetatileColumnIsVoid(struct Dkc2MetatileClassifyContext *ctx,
+                                     uint32_t metatile_x,
+                                     uint32_t metatile_y, bool east_side,
+                                     uint32_t edge_metatile_x);
+
+/* Continuing a wall by copying its edge column repeats whatever stands in
+ * that column once per margin column: the mine's panel of red lamps beside
+ * the Kongs appeared three times in a row. The level map knows what
+ * belongs beside each of its metatiles, because the same lamp panel sits at
+ * the edge of ten other shafts with the level's rock fill to its east. A
+ * continued cell therefore takes the metatile the map most often places
+ * beside the previous one on the outward side (the first such metatile
+ * that is fully populated), column by column away from the wall, which
+ * reproduces the level's own fill sequences. Successors and per-id fills
+ * are cached per level and recounted every kDkc2MetatileCacheRefresh
+ * frames, since a level can decompress a new map section into the same
+ * bank addresses. */
+enum { kDkc2MetatileCacheRefresh = 256 };
+enum { kDkc2SuccessorUnknown = 0xffffu, kDkc2SuccessorNone = 0u };
+static uint16_t s_metatile_successor[2][0x4000];
+static uint8_t s_metatile_id_fill[0x4000];   /* Dkc2VideoMetatileFill, 0 unknown */
+static uint64_t s_metatile_cache_signature;
+static uint32_t s_metatile_cache_frame;
+static bool s_metatile_cache_valid;
+
+static void Dkc2RefreshMetatileCaches(uint32_t frame) {
+  const uint64_t signature = Dkc2LevelSourceSignature();
+  if (s_metatile_cache_valid && s_metatile_cache_signature == signature &&
+      frame - s_metatile_cache_frame < (uint32_t)kDkc2MetatileCacheRefresh)
+    return;
+  memset(s_metatile_successor, 0xff, sizeof s_metatile_successor);
+  memset(s_metatile_id_fill, 0, sizeof s_metatile_id_fill);
+  s_metatile_cache_signature = signature;
+  s_metatile_cache_frame = frame;
+  s_metatile_cache_valid = true;
+}
+
+/* The fill of a metatile definition by id, independent of any map cell. */
+static Dkc2VideoMetatileFill Dkc2MetatileIdFill(
+    struct Dkc2MetatileClassifyContext *ctx, uint16_t id) {
+  id &= 0x3fffu;
+  if (s_metatile_id_fill[id] != 0)
+    return (Dkc2VideoMetatileFill)s_metatile_id_fill[id];
+  int transparent = 0;
+  for (unsigned j = 0; j < 4u; j++) {
+    for (unsigned i = 0; i < 4u; i++) {
+      uint16_t entry = 0;
+      if (!Dkc2VideoDecodeMetatileEntry(ctx->bank_data, 0x10000u,
+                                        ctx->metatile_base, id, i, j, &entry))
+        return kDkc2VideoMetatileUnknown;
+      if (Dkc2VideoCharacterIsTransparent(ctx->vram, 0x8000u,
+                                          ctx->character_base, entry))
+        transparent++;
+    }
+  }
+  const Dkc2VideoMetatileFill fill =
+      transparent == 16 ? kDkc2VideoMetatileEmpty
+      : transparent == 0 ? kDkc2VideoMetatileFull : kDkc2VideoMetatilePartial;
+  s_metatile_id_fill[id] = (uint8_t)fill;
+  return fill;
+}
+
+/* The fully populated metatile the map most often places beside `id` on
+ * the outward side; kDkc2SuccessorNone when the map never continues it. */
+static uint16_t Dkc2MetatileSuccessor(struct Dkc2MetatileClassifyContext *ctx,
+                                      uint16_t id, bool east_side) {
+  uint16_t *slot = &s_metatile_successor[east_side ? 1 : 0][id & 0x3fffu];
+  if (*slot != (uint16_t)kDkc2SuccessorUnknown)
+    return *slot;
+  uint16_t ids[8], counts[8];
+  const unsigned found = Dkc2VideoMetatileNeighbours(
+      ctx->bank_data, 0x10000u, ctx->map_base, ctx->metatile_base,
+      ctx->layout, ctx->row_bytes, (uint16_t)(id & 0x3fffu), east_side, ids,
+      counts, 8u);
+  uint16_t chosen = (uint16_t)kDkc2SuccessorNone;
+  for (unsigned n = 0; n < found; n++) {
+    if (Dkc2MetatileIdFill(ctx, ids[n]) == kDkc2VideoMetatileFull) {
+      chosen = ids[n];
+      break;
+    }
+  }
+  *slot = chosen;
+  return chosen;
+}
+
+/* The metatile for a continued cell `steps` columns beyond the wall's edge
+ * cell at (edge_x, row): the map's successor chain from that cell's
+ * metatile. A wall row the map never continues (the lamp panel's unique
+ * upper half) starts its chain from the nearest wall row above or below
+ * that the map does continue, so the panel is not repeated. Returns false
+ * when no row of the wall offers a chain; the caller then copies the edge
+ * column as before. */
+enum { kDkc2WallChainReach = 4 };
+static bool Dkc2WallChainMetatile(struct Dkc2MetatileClassifyContext *ctx,
+                                  uint32_t edge_x, uint32_t row,
+                                  bool east_side, uint32_t steps,
+                                  uint16_t *metatile) {
+  uint16_t start = 0;
+  if (!Dkc2VideoReadLevelMetatile(ctx->bank_data, 0x10000u, ctx->map_base,
+                                  ctx->layout, ctx->row_bytes, edge_x, row,
+                                  &start))
+    return false;
+  uint16_t id = Dkc2MetatileSuccessor(ctx, start, east_side);
+  if (id == (uint16_t)kDkc2SuccessorNone) {
+    bool above_open = true, below_open = true;
+    for (uint32_t d = 1; d <= (uint32_t)kDkc2WallChainReach &&
+                         id == (uint16_t)kDkc2SuccessorNone; d++) {
+      const uint32_t candidates[2] = {row - d, row + d};
+      for (unsigned k = 0; k < 2u && id == (uint16_t)kDkc2SuccessorNone; k++) {
+        bool *open = k == 0 ? &above_open : &below_open;
+        if (!*open || (k == 0 && row < d))
+          continue;
+        const uint32_t r = candidates[k];
+        uint16_t other = 0;
+        if (Dkc2ClassifyMetatile(ctx, edge_x, r) != kDkc2VideoMetatileFull ||
+            !Dkc2VideoReadLevelMetatile(ctx->bank_data, 0x10000u,
+                                        ctx->map_base, ctx->layout,
+                                        ctx->row_bytes, edge_x, r, &other)) {
+          *open = false;
+          continue;
+        }
+        id = Dkc2MetatileSuccessor(ctx, other, east_side);
+      }
+    }
+    if (id == (uint16_t)kDkc2SuccessorNone)
+      return false;
+  }
+  for (uint32_t step = 1; step < steps; step++) {
+    const uint16_t next = Dkc2MetatileSuccessor(ctx, id, east_side);
+    if (next == (uint16_t)kDkc2SuccessorNone)
+      break;   /* the chain ends: the last metatile carries on */
+    id = next;
+  }
+  *metatile = id;
+  return true;
+}
+
+/* A void margin metatile column is a player-held wall when the structural
+ * rule continues it on at least one visible row: the wall is proven there,
+ * and the rows it fails closed on (a partial edge metatile, the boundary of
+ * a cave pocket the console cuts at its screen edge) may mirror the
+ * authored terrain across the wall line instead of opening the pocket
+ * further than the console ever shows it. Cached per column per pass. */
+static bool Dkc2MetatileColumnIsHeldWall(
+    struct Dkc2MetatileClassifyContext *ctx, bool east_side,
+    uint32_t metatile_x, uint32_t edge_metatile_x) {
+  const bool cached = metatile_x >= ctx->cache_base_x &&
+                      metatile_x - ctx->cache_base_x < kDkc2MetatileCacheWidth;
+  if (cached && ctx->column_wall[metatile_x - ctx->cache_base_x] != 0)
+    return ctx->column_wall[metatile_x - ctx->cache_base_x] == 1;
+  bool wall = false;
+  for (uint32_t my = ctx->visible_first_y; my <= ctx->visible_last_y; my++) {
+    uint32_t source = 0;
+    if (!Dkc2MetatileColumnIsVoid(ctx, metatile_x, my, east_side,
+                                  edge_metatile_x))
+      break;
+    if (Dkc2VideoFindStructuralWallSource(Dkc2ClassifyMetatile, ctx,
+                                          east_side, metatile_x,
+                                          edge_metatile_x, my, &source)) {
+      wall = true;
+      break;
+    }
+  }
+  if (cached)
+    ctx->column_wall[metatile_x - ctx->cache_base_x] = wall ? 1 : 2;
+  return wall;
+}
+
+/* The margin column is open beside a player-held wall at `metatile_y`:
+ * empty from the visible top down through the row, whether that spans the
+ * whole visible height (the crystal shaft) or ends on a floor that
+ * continues past the wall (the mine at camera 256, whose neighbouring room
+ * showed its backdrop through the void above that floor), or part of an
+ * empty run at least kDkc2WallVoidRunRows metatiles tall that a wall seals
+ * from the view on every row of the run (the unauthored gap between two
+ * mine shafts, thirteen rows of void under a ceiling of authored rock that
+ * the camera scrolls into view first). A porthole or a doorway is one or
+ * two rows tall with wall above it and fails both tests, and a flooded
+ * hold's water beyond the view fails the second: its run opens into the
+ * view on the rows above the crate the rule would otherwise continue into
+ * it. The cache keeps the first non-empty row of the column. */
+enum { kDkc2WallVoidRunRows = 4, kDkc2WallVoidRunReach = 16 };
+static bool Dkc2MetatileRowSealed(struct Dkc2MetatileClassifyContext *ctx,
+                                  uint32_t metatile_x, uint32_t metatile_y,
+                                  bool east_side, uint32_t edge_metatile_x) {
+  /* Walking from the margin column toward the view, a non-empty cell must
+   * come no deeper than one column inside the cartridge's edge column: a
+   * cave pocket's boundary row has an empty edge cell in front of its
+   * partial one, open water has empty cells all the way in. */
+  const uint32_t deepest = east_side
+                               ? (edge_metatile_x > 0 ? edge_metatile_x - 1u : 0u)
+                               : edge_metatile_x + 1u;
+  uint32_t c = metatile_x;
+  for (;;) {
+    if (east_side) {
+      if (c == 0 || c <= deepest)
+        return false;
+      c--;
+    } else {
+      if (c >= deepest)
+        return false;
+      c++;
+    }
+    if (Dkc2ClassifyMetatile(ctx, c, metatile_y) != kDkc2VideoMetatileEmpty)
+      return true;
+  }
+}
+
+static bool Dkc2MetatileColumnVoidRun(struct Dkc2MetatileClassifyContext *ctx,
+                                      uint32_t metatile_x,
+                                      uint32_t metatile_y, bool east_side,
+                                      uint32_t edge_metatile_x) {
+  if (Dkc2ClassifyMetatile(ctx, metatile_x, metatile_y) !=
+      kDkc2VideoMetatileEmpty)
+    return false;
+  uint32_t top = metatile_y, bottom = metatile_y;
+  for (uint32_t d = 1; d <= (uint32_t)kDkc2WallVoidRunReach && d <= metatile_y;
+       d++) {
+    if (Dkc2ClassifyMetatile(ctx, metatile_x, metatile_y - d) !=
+        kDkc2VideoMetatileEmpty)
+      break;
+    top = metatile_y - d;
+  }
+  for (uint32_t d = 1; d <= (uint32_t)kDkc2WallVoidRunReach; d++) {
+    if (Dkc2ClassifyMetatile(ctx, metatile_x, metatile_y + d) !=
+        kDkc2VideoMetatileEmpty)
+      break;
+    bottom = metatile_y + d;
+  }
+  if (bottom - top + 1u < (uint32_t)kDkc2WallVoidRunRows)
+    return false;
+  for (uint32_t r = top; r <= bottom; r++) {
+    if (!Dkc2MetatileRowSealed(ctx, metatile_x, r, east_side,
+                               edge_metatile_x))
+      return false;
+  }
+  return true;
+}
+
+static bool Dkc2MetatileColumnIsVoid(struct Dkc2MetatileClassifyContext *ctx,
+                                     uint32_t metatile_x,
+                                     uint32_t metatile_y, bool east_side,
+                                     uint32_t edge_metatile_x) {
+  const bool cached = metatile_x >= ctx->cache_base_x &&
+                      metatile_x - ctx->cache_base_x < kDkc2MetatileCacheWidth;
+  uint32_t first_solid = ctx->visible_last_y + 1u;
+  if (cached && ctx->column_void[metatile_x - ctx->cache_base_x] != 0) {
+    first_solid = ctx->visible_first_y +
+                  (uint32_t)(ctx->column_void[metatile_x - ctx->cache_base_x] -
+                             1u);
+  } else {
+    for (uint32_t my = ctx->visible_first_y; my <= ctx->visible_last_y;
+         my++) {
+      if (Dkc2ClassifyMetatile(ctx, metatile_x, my) !=
+          kDkc2VideoMetatileEmpty) {
+        first_solid = my;
+        break;
+      }
+    }
+    if (cached)
+      ctx->column_void[metatile_x - ctx->cache_base_x] =
+          (uint8_t)(first_solid - ctx->visible_first_y + 1u);
+  }
+  return metatile_y < first_solid ||
+         Dkc2MetatileColumnVoidRun(ctx, metatile_x, metatile_y, east_side,
+                                   edge_metatile_x);
+}
+
+static bool Dkc2PrefillWidescreenLevelTerrain(uint8_t layer_mask,
+                                              int terrain_layer,
+                                              Dkc2VideoLevelLayout layout,
+                                              uint32_t rendered_x,
+                                              uint32_t cartridge_x,
+                                              uint32_t camera_y) {
+  memset(&s_terrain_prefill_stats, 0, sizeof s_terrain_prefill_stats);
+  if (terrain_layer < 0 || terrain_layer >= 2 ||
+      layout == kDkc2VideoLevelLayoutUnknown ||
+      !(layer_mask & (uint8_t)(1u << terrain_layer)) ||
+      PPU_bigTiles(g_ppu, terrain_layer))
+    return false;
+
+  uint8_t bank = 0;
+  const uint8_t *bank_data = Dkc2LevelSourceBank(&bank);
+  if (!bank_data)
+    return false;
+
+  const uint16_t map_base = Dkc2ReadWram16(0x0098);
+  const uint16_t metatile_base = Dkc2ReadWram16(0x17b4);
+  const uint16_t maximum_scroll_x = Dkc2ReadWram16(0x0afc);
+  const uint16_t maximum_scroll_y = Dkc2ReadWram16(0x0afe);
+  uint16_t transparent_tile = 0;
+  if (maximum_scroll_x == 0 ||
+      !Dkc2VideoFindTransparent4bppTile(
+          g_ppu->vram, 0x8000u,
+          (uint16_t)PPU_bgTileAdr(g_ppu, terrain_layer),
+          &transparent_tile))
+    return false;
+  const uint32_t extra = (uint32_t)Dkc2VideoExtra();
+  /*
+   * The rolling column builder stages one complete 32x32 metatile beyond
+   * the native camera limit so fine scrolling never exposes an incomplete
+   * edge. The following metatile belongs to unrelated WRAM in every case.
+   * The presentation clamp keeps the visible margins inside the authored
+   * camera extent, so this limit only protects the fine-scroll guard tiles.
+   */
+  const uint32_t source_tile_limit =
+      ((uint32_t)maximum_scroll_x + 0x20u + 7u) >> 3;
+  const uint32_t source_tile_limit_y =
+      ((uint32_t)maximum_scroll_y + 7u) >> 3;
+  /* Keep one decoded tile beyond both host margins. A fine-scroll phase can
+   * make the final one or two pixels address the adjacent tile even though
+   * the nominal 342-pixel span still ends inside the previous source cell.
+   * Without this guard Pirate Panic briefly fell through to the verified
+   * blank tile during Rambi's fast down-right camera move (frame 6404). */
+  const uint32_t guard = 8u;
+  const uint32_t west_extent = extra + guard;
+  const uint32_t first_x =
+      rendered_x > west_extent ? rendered_x - west_extent : 0;
+  const uint32_t last_x =
+      rendered_x + (uint32_t)kDkc2VideoNativeWidth - 1u + extra + guard;
+  const uint32_t first_tile_x = first_x >> 3;
+  const uint32_t last_tile_x = last_x >> 3;
+  const uint32_t ppu_scroll_y = s_terrain_phase_v & 0x03ffu;
+  s_terrain_prefill_stats.phase_h = s_terrain_phase_h;
+  s_terrain_prefill_stats.phase_v = s_terrain_phase_v;
+  s_terrain_prefill_stats.phase_from_band = s_terrain_phase_from_band ? 1u : 0u;
+  const uint32_t fine_y = ppu_scroll_y & 7u;
+  const int visible_tile_rows =
+      (int)(((uint32_t)kDkc2VideoHeight + fine_y + 7u) >> 3);
+  /*
+   * Reproduce the cartridge column builder's vertical rotation rather
+   * than assuming WRAM camera Y is the already-latched PPU row.
+   * $B5:ACC0-$B5:ACCF starts $0100 pixels above the camera;
+   * $B5:ADA9-$B5:ADD0 then rotates those 36 source entries into the
+   * 32-row rolling tilemap. The rendered PPU phase can trail the next
+   * WRAM camera value by one pixel at an NMI boundary, so both the source
+   * row and shadow key must derive from that same PPU phase. Mixing the
+   * two phases turns an 8-pixel boundary into a transient +31-row wrap,
+   * and PrefillTile then preserves the bad margin entry indefinitely.
+   *
+   * Decode one guard row above and below the viewport as well: an HDMA
+   * band that shares the terrain phase may lead the frame anchor by up to
+   * four pixels vertically, and its margin lookups must not fall through.
+   */
+  const uint32_t top_shadow_row =
+      Dkc2VideoLevelSourceTileY((uint16_t)ppu_scroll_y, camera_y, 0);
+  const uint32_t top_source_row =
+      Dkc2VideoLevelMapTileY((uint16_t)ppu_scroll_y, camera_y, 0);
+  size_t decoded = 0;
+  size_t expected = 0;
+  unsigned row_bytes = 0;
+  if (layout != kDkc2VideoLevelLayoutHorizontal) {
+    unsigned percent = 0;
+    row_bytes = Dkc2CalibrateRowStride(
+        bank_data, map_base, metatile_base, layout, terrain_layer,
+        cartridge_x >= 0x0100u ? (cartridge_x - 0x0100u) >> 3 : 0u,
+        top_source_row, (uint32_t)(ppu_scroll_y >> 3), &percent);
+    s_terrain_prefill_stats.row_bytes = (uint16_t)row_bytes;
+    s_terrain_prefill_stats.row_match_percent = (uint8_t)percent;
+    if (row_bytes == 0u)
+      return false;
+  }
+  Dkc2MetatileClassifyContext classify;
+  memset(&classify, 0, sizeof classify);
+  classify.bank_data = bank_data;
+  classify.map_base = map_base;
+  classify.metatile_base = metatile_base;
+  classify.layout = layout;
+  classify.row_bytes = row_bytes;
+  classify.vram = g_ppu->vram;
+  classify.character_base = (uint16_t)PPU_bgTileAdr(g_ppu, terrain_layer);
+  classify.source_tile_limit_x = source_tile_limit;
+  classify.source_tile_limit_y =
+      (layout == kDkc2VideoLevelLayoutVertical ||
+       layout == kDkc2VideoLevelLayoutSquare ||
+       layout == kDkc2VideoLevelLayoutNarrowVertical)
+          ? source_tile_limit_y : 0u;
+  classify.cache_base_x =
+      first_tile_x >= 32u + 8u ? (first_tile_x - 32u - 8u) >> 2 : 0u;
+  classify.cache_base_y = top_source_row >= 8u ? (top_source_row - 8u) >> 2
+                                               : 0u;
+  classify.visible_first_y = top_source_row >> 2;
+  classify.visible_last_y =
+      (top_source_row + (uint32_t)visible_tile_rows - 1u) >> 2;
+  /* The cartridge's own window in decoded-map tile space: structural
+   * continuation reaches from a margin cell toward this edge. */
+  const uint32_t cartridge_first_tile = cartridge_x >> 3;
+  const uint32_t cartridge_last_tile =
+      (cartridge_x + (uint32_t)kDkc2VideoNativeWidth - 1u) >> 3;
+  /* DKC2_TERRAIN_FILL_MAP=1: print the classifier's metatile fill map for
+   * the prefill window ('.' empty, '+' partial, '#' full, '?' undecoded),
+   * eight columns past it on each side and two rows above and below the
+   * visible rows. The column the cartridge's window starts in is marked
+   * with '|' before it. Reading this map is far quicker than reasoning
+   * about a wall rule from screenshots. */
+  Dkc2RefreshMetatileCaches(s_plane_frame);
+  /* DKC2_TERRAIN_FILL_MAP=2 adds each cell's metatile id, followed by '>'
+   * when the map never places a fully populated metatile east of it and
+   * '<' for west ('*' for neither). */
+  if (getenv("DKC2_TERRAIN_FILL_MAP")) {
+    const bool with_ids = getenv("DKC2_TERRAIN_FILL_MAP")[0] == '2';
+    const uint32_t first_mx = first_tile_x >= 32u + 32u
+                                  ? (first_tile_x - 32u - 32u) >> 2 : 0u;
+    const uint32_t last_mx = (last_tile_x - 32u + 32u) >> 2;
+    const uint32_t first_my =
+        classify.visible_first_y >= 2u ? classify.visible_first_y - 2u : 0u;
+    fprintf(stderr, "terrain fill map: metatile cols %u..%u, rows %u..%u, "
+            "cartridge cols %u..%u\n", first_mx, last_mx, first_my,
+            classify.visible_last_y + 2u, cartridge_first_tile >= 32u
+                ? (cartridge_first_tile - 32u) >> 2 : 0u,
+            cartridge_last_tile >= 32u ? (cartridge_last_tile - 32u) >> 2 : 0u);
+    for (uint32_t my = first_my; my <= classify.visible_last_y + 2u; my++) {
+      fprintf(stderr, "  row %4u: ", my);
+      for (uint32_t mx = first_mx; mx <= last_mx; mx++) {
+        const Dkc2VideoMetatileFill fill =
+            Dkc2ClassifyMetatile(&classify, mx, my);
+        if (cartridge_first_tile >= 32u &&
+            mx == ((cartridge_first_tile - 32u) >> 2))
+          fputc('|', stderr);
+        if (cartridge_last_tile >= 32u &&
+            mx == ((cartridge_last_tile - 32u) >> 2) + 1u)
+          fputc('|', stderr);
+        fputc(fill == kDkc2VideoMetatileEmpty ? '.'
+              : fill == kDkc2VideoMetatilePartial ? '+'
+              : fill == kDkc2VideoMetatileFull ? '#' : '?', stderr);
+      }
+      if (with_ids) {
+        fputs("   ", stderr);
+        for (uint32_t mx = first_mx; mx <= last_mx; mx++) {
+          uint16_t id = 0;
+          if (Dkc2VideoReadLevelMetatile(classify.bank_data, 0x10000u,
+                                         classify.map_base, classify.layout,
+                                         classify.row_bytes, mx, my, &id))
+          {
+            const bool east_ok =
+                id == 0 || Dkc2MetatileSuccessor(&classify, id, true) !=
+                               (uint16_t)kDkc2SuccessorNone;
+            const bool west_ok =
+                id == 0 || Dkc2MetatileSuccessor(&classify, id, false) !=
+                               (uint16_t)kDkc2SuccessorNone;
+            fprintf(stderr, " %03x%c", id,
+                    !east_ok && !west_ok ? '*' : !east_ok ? '>'
+                    : !west_ok ? '<' : ' ');
+          }
+          else
+            fputs(" ??? ", stderr);
+        }
+      }
+      fputc('\n', stderr);
+    }
+  }
+  for (uint32_t tile_x = first_tile_x; tile_x <= last_tile_x; tile_x++) {
+    for (int row = -1; row <= visible_tile_rows; row++) {
+      uint16_t entry = 0;
+      const bool margin =
+          Dkc2VideoTileTouchesWidescreenMargin(tile_x, rendered_x);
+      /* Outside the cartridge's authentic window, whatever the presentation
+       * bias placed on screen: only these cells may be continued from a
+       * wall, and every one of them takes the decoded map over live history.
+       * The columns a bias moves into a margin are still inside that window
+       * and keep their captured ring content (so the 4:3 oracle stays exact
+       * even on an unstaged guard row). The columns a bias slides into view
+       * used to keep whatever history they had, but that history can be a
+       * misattributed capture: in a vertical stage the cartridge rewrites
+       * the ring's other page with the same stale 32 entries on every row
+       * upload, and a one-pixel leftward camera jitter is enough for the
+       * store to file those writes under the chunk the strip shows. The
+       * crow's-nest art then sat on the mast at the right wall until the
+       * player left the stage. The decode is exact for static terrain and
+       * ForceTile still yields to a game write from the last frame. */
+      const bool outside_cartridge =
+          Dkc2VideoTileTouchesWidescreenMargin(tile_x, cartridge_x);
+      const bool force_decoded = outside_cartridge;
+      const uint32_t shadow_tile_y =
+          (uint32_t)((int64_t)top_shadow_row + row);
+      const uint32_t source_tile_y =
+          (uint32_t)((int64_t)top_source_row + row) & 0x1fffu;
+      /* Set when a continued cell's entry came from the map's own
+       * adjacency rather than a map cell. */
+      bool entry_ready = false;
+      expected++;
+      if (margin)
+        s_terrain_prefill_stats.margin_expected++;
+      /*
+       * DKC2's camera/object coordinate system starts one 256-pixel page
+       * after the decompressed level map. This is the same relationship made
+       * explicit by $B5:ACA8-$B5:ACB7 (source column) and
+       * $B5:ADF0-$B5:AE01 (rolling-VRAM destination): while moving right, a
+       * source column at X is uploaded to the VRAM column for X+$0100.
+       *
+       * A matching frame-5499 WRAM/VRAM calibration confirms the mapping:
+       * source tile (shadow key - 32) agrees with 1,754/2,048 live BG1 cells
+       * (85.6%); the next-best tested offset agrees with only 746/2,048.
+       * Remaining differences are expected dynamic/partially staged cells.
+       *
+       * No authored terrain exists west of that origin or beyond the last
+       * camera position plus the viewport. The edge policy decides whether
+       * such a column mirrors the nearest authored columns or stays
+       * verified transparent.
+       */
+      uint32_t source_tile_x = 0;
+      bool mirror_horizontally = false;
+      const int edge = Dkc2VideoResolveEdgeTile(
+          tile_x, maximum_scroll_x, &source_tile_x, &mirror_horizontally);
+      /*
+       * $0AFC is the camera's maximum horizontal scroll after the cartridge
+       * subtracts the 256-pixel native viewport ($B5:E36C-$B5:E373).
+       * Adding the streamer's one 32-pixel guard metatile gives the exclusive
+       * safe source width. Reading the following metatile crosses into
+       * unrelated WRAM; this was the colorful far-right stripe in the
+       * frame-9000 capture. Outside that guard, use a verified transparent
+       * character so lower layers remain visible without inventing or
+       * repeating terrain.
+       */
+      if (edge < 0 || source_tile_x >= source_tile_limit) {
+        WsShadowForceTile(
+            terrain_layer, tile_x, shadow_tile_y, transparent_tile);
+        decoded++;
+        Dkc2RecordTerrainPrefillTile(
+            terrain_layer, tile_x, shadow_tile_y, transparent_tile, margin);
+        continue;
+      }
+      if ((layout == kDkc2VideoLevelLayoutVertical ||
+           layout == kDkc2VideoLevelLayoutSquare ||
+           layout == kDkc2VideoLevelLayoutNarrowVertical) &&
+          (maximum_scroll_y == 0 ||
+           source_tile_y >= source_tile_limit_y)) {
+        WsShadowForceTile(
+            terrain_layer, tile_x, shadow_tile_y, transparent_tile);
+        decoded++;
+        Dkc2RecordTerrainPrefillTile(
+            terrain_layer, tile_x, shadow_tile_y, transparent_tile, margin);
+        continue;
+      }
+      if (edge == 0 && outside_cartridge && cartridge_first_tile >= 32u) {
+        const bool east =
+            ((uint64_t)tile_x << 3) >= (uint64_t)cartridge_x +
+                                           kDkc2VideoNativeWidth;
+        const uint32_t edge_source_tile =
+            (east ? cartridge_last_tile : cartridge_first_tile) - 32u;
+        uint32_t source_metatile_x = 0;
+        uint32_t mirrored_tile_x = 0;
+        if (Dkc2MetatileColumnIsVoid(&classify, source_tile_x >> 2,
+                                     source_tile_y >> 2, east,
+                                     edge_source_tile >> 2) &&
+            Dkc2VideoFindStructuralWallSource(
+                Dkc2ClassifyMetatile, &classify, east, source_tile_x >> 2,
+                edge_source_tile >> 2, source_tile_y >> 2,
+                &source_metatile_x)) {
+          const uint32_t target_metatile_x = source_tile_x >> 2;
+          const uint32_t steps = east ? target_metatile_x - source_metatile_x
+                                      : source_metatile_x - target_metatile_x;
+          uint16_t chained = 0;
+          if (Dkc2WallChainMetatile(&classify, source_metatile_x,
+                                    source_tile_y >> 2, east, steps,
+                                    &chained) &&
+              Dkc2VideoDecodeMetatileEntry(bank_data, 0x10000u, metatile_base,
+                                           chained, source_tile_x & 3u,
+                                           source_tile_y & 3u, &entry)) {
+            entry_ready = true;
+            s_terrain_prefill_stats.chained++;
+          } else {
+            source_tile_x = source_metatile_x * 4u + (source_tile_x & 3u);
+          }
+          s_terrain_prefill_stats.structural++;
+        } else if (Dkc2MetatileColumnIsVoid(&classify, source_tile_x >> 2,
+                                            source_tile_y >> 2, east,
+                                            edge_source_tile >> 2) &&
+                   Dkc2MetatileColumnIsHeldWall(
+                       &classify, east, source_tile_x >> 2,
+                       edge_source_tile >> 2) &&
+                   Dkc2VideoMirrorSourceTileAcrossEdge(
+                       source_tile_x, edge_source_tile, east,
+                       &mirrored_tile_x) &&
+                   mirrored_tile_x < source_tile_limit) {
+          /* The rows the structural rule fails closed on: mirror the
+           * authored terrain across the held wall, as the reflect policy
+           * does at a level's own wall. */
+          source_tile_x = mirrored_tile_x;
+          mirror_horizontally = !mirror_horizontally;
+          s_terrain_prefill_stats.mirrored++;
+        }
+      }
+      if (!entry_ready &&
+          !Dkc2DecodeLevelTile(bank_data, map_base, metatile_base, layout,
+                               row_bytes, source_tile_x, source_tile_y,
+                               &entry))
+        continue;
+      if (mirror_horizontally)
+        entry ^= 0x4000u;
+      /* At the horizontal $xxff->$xx00 vertical page boundary the first
+       * visible tile row is supplied by the live rolling map, not by a full
+       * decompressed source row. The native row is one pixel high and the
+       * retained map can still contain a previous ship section there. Never
+       * seed those unobserved side cells from that stale row. */
+      if (layout == kDkc2VideoLevelLayoutHorizontal && row <= 0) {
+        const uint32_t tile_pixel_x = tile_x << 3;
+        if (tile_pixel_x < cartridge_x ||
+            tile_pixel_x >= cartridge_x + kDkc2VideoNativeWidth) {
+          WsShadowForceTile(
+              terrain_layer, tile_x, shadow_tile_y, transparent_tile);
+        }
+        decoded++;
+        Dkc2RecordTerrainPrefillTile(
+            terrain_layer, tile_x, shadow_tile_y, transparent_tile, margin);
+        continue;
+      }
+      /*
+       * An older captured VRAM/DMA-pad tile can survive in a world cell that
+       * the verified level map says is transparent. That produced the stray
+       * deck fragments in Pirate Panic's upper-left margin. Clear only those
+       * verified void cells every frame; non-transparent tiles retain real
+       * history so dynamic ship tilemap details are not erased by a static
+       * source reconstruction.
+       */
+      if (Dkc2VideoIsTransparentTileEntry(entry, transparent_tile) ||
+          force_decoded)
+        WsShadowForceTile(terrain_layer, tile_x, shadow_tile_y, entry);
+      else
+        WsShadowPrefillTile(terrain_layer, tile_x, shadow_tile_y, entry);
+      decoded++;
+      Dkc2RecordTerrainPrefillTile(
+          terrain_layer, tile_x, shadow_tile_y, entry, margin);
+    }
+  }
+  /* The west hold for the glide, read for the next frame. It is entered
+   * when the columns the unbiased margin would reach beside the window are
+   * empty for the whole visible height, the camera has not moved since the
+   * last frame, and the player stands within kDkc2HoldPlayerEdge pixels of
+   * the frame's west edge: pinned at the authored world's edge. It persists
+   * while the void stays beside the window, whatever the camera does, so
+   * the glide releases the slide with travel as at any wall; the bound is
+   * the window's first column at entry. */
+  {
+    uint32_t hold_column = 0;
+    const unsigned reach = ((unsigned)Dkc2VideoExtra() + 31u) / 32u + 1u;
+    const bool void_beside =
+        cartridge_first_tile >= 32u &&
+        Dkc2VideoHoldWest(Dkc2ClassifyMetatile, &classify,
+                          (cartridge_first_tile - 32u) >> 2, reach,
+                          classify.visible_first_y, classify.visible_last_y,
+                          &hold_column);
+    if (s_hold_west_valid) {
+      s_hold_west_valid = void_beside;
+    } else if (void_beside) {
+      const uint32_t player_x = Dkc2ReadWram16(0x0A2A);
+      const bool pinned =
+          s_hold_camera_valid && s_hold_camera_x == cartridge_x &&
+          player_x >= cartridge_x &&
+          player_x - cartridge_x < (uint32_t)kDkc2HoldPlayerEdge;
+      if (pinned || s_hold_start_frames > 0) {
+        s_hold_west_valid = true;
+        s_hold_west_x = (hold_column << 5) + 0x100u;
+      }
+    }
+    if (s_hold_start_frames > 0)
+      s_hold_start_frames--;
+    s_hold_camera_x = cartridge_x;
+    s_hold_camera_valid = true;
+  }
+  s_terrain_prefill_stats.expected = expected;
+  s_terrain_prefill_stats.decoded = decoded;
+  (void)bank;
+  return expected != 0 && decoded == expected;
+}
+
+/*
+ * Ship-deck rigging (the Gangplank Galleon foreground on BG3).
+ *
+ * The deck levels' rigging is a physical 64-column BG3 that the cartridge
+ * streams with no lead at all: $B5:AA88 uploads the one 8-pixel column
+ * entering the native view the frame it arrives, and $B5:AC25 rewrites a
+ * row's 64 ring words from a buffer of which only the 33 native columns were
+ * rebuilt, so every ring column outside the native window holds either the
+ * column from 512 pixels away or a previous row's leftovers. A host margin
+ * read from that ring showed a second rope strand cutting the real one off
+ * at a false apex. The rigging map itself is static ROM data (see
+ * Dkc2VideoDecodeRiggingTile), so the host decodes it into a third
+ * world-keyed shadow layer. The decode is trusted only after it reproduces
+ * all 32 fully uploaded native columns over the 28 fully visible rows for
+ * the current frame; a configured rigging layer whose decode fails shows no
+ * margin at all rather than the ring.
+ */
+enum { kDkc2RiggingLayer = 2 };
+
+typedef struct Dkc2RiggingPlan {
+  bool configured;      /* the cartridge's rigging streamer is active */
+  bool ready;           /* the ROM decode reproduced the native window */
+  uint32_t world_x;     /* rigging scroll X at the rendered PPU phase */
+  uint32_t world_y;     /* map Y of the frame anchor (PPU vertical phase) */
+  uint16_t blank_entry; /* verified transparent 2bpp character */
+  const uint8_t *bank_data;
+} Dkc2RiggingPlan;
+
+static Dkc2RiggingStats s_rigging_stats;
+
+void Dkc2GetRiggingStats(Dkc2RiggingStats *out) {
+  if (out)
+    *out = s_rigging_stats;
+}
+
+static uint16_t Dkc2RiggingRingEntry(uint32_t tile_x, uint32_t tile_y) {
+  const uint16_t map_base =
+      (uint16_t)PPU_bgTilemapAdr(g_ppu, kDkc2RiggingLayer);
+  const uint16_t word =
+      (uint16_t)(map_base + ((tile_x & 32u) ? 0x400u : 0u) +
+                 ((tile_y & 31u) << 5) + (tile_x & 31u));
+  return g_ppu->vram[word & 0x7fffu];
+}
+
+static void Dkc2PlanRigging(Dkc2RiggingPlan *plan) {
+  memset(plan, 0, sizeof *plan);
+  if ((g_ppu->bgmode & 7u) != 1u ||
+      !(g_ppu->bgXsc[kDkc2RiggingLayer] & 1u) ||
+      PPU_bigTiles(g_ppu, kDkc2RiggingLayer) ||
+      !((g_ppu->screenEnabled[0] | g_ppu->screenEnabled[1]) & 0x04u))
+    return;
+  const uint16_t rigging_x = Dkc2ReadWram16(0x00b8);
+  const uint16_t camera_y = Dkc2ReadWram16(0x17c0);
+  if (camera_y < 0x0101u)
+    return;
+  /*
+   * Key both axes by the rendered PPU phase, as the terrain owner does. The
+   * cartridge advances the WRAM rigging scroll during its frame logic and
+   * applies it to the PPU, together with the column upload, in the following
+   * NMI, so at draw time the ring and the bookkeeping below agree with the
+   * PPU phase, not with the newer WRAM value. The rigging map's Y origin is
+   * camera Y - $0100 on the top line, written as an 8-bit PPU vertical
+   * scroll, (camera Y - $0101) & $FF, so Y is rebuilt in 256-pixel epochs.
+   */
+  plan->world_x = Dkc2VideoTerrainShadowX(
+      g_ppu->hScroll[kDkc2RiggingLayer], rigging_x);
+  plan->world_y = Dkc2VideoRiggingShadowY(
+      g_ppu->vScroll[kDkc2RiggingLayer], camera_y);
+  /*
+   * The streamer's own latches identify it: $B5:AA88 records the origin of
+   * the last uploaded column in $C6, and $B5:AC25 records the last uploaded
+   * row origin, camera Y & $F8 (eight bits, shared with the terrain rows),
+   * in $17CE. Each origin may sit one 8-pixel cell from the rendered phase
+   * around an upload. ($17BC is not a copy of the scroll: $80:E4EB keeps
+   * the 5/4 camera target there and moves $B8 toward it by at most 8 pixels
+   * per frame, so after Rambi's charge $B8 trails it and never catches up.)
+   * The decode verification below is the exactness gate.
+   */
+  const int32_t column_origin = (int32_t)Dkc2ReadWram16(0x00c6);
+  const int32_t row_origin = (int32_t)(Dkc2ReadWram16(0x17ce) & 0xffu);
+  const int32_t column_delta =
+      column_origin - (int32_t)(plan->world_x & 0xfff8u);
+  int32_t row_delta =
+      row_origin - (int32_t)((plan->world_y + 1u) & 0xf8u);
+  if (row_delta > 0x80)
+    row_delta -= 0x100;
+  else if (row_delta < -0x80)
+    row_delta += 0x100;
+  const bool streamer_active =
+      column_delta >= -8 && column_delta <= 8 &&
+      row_delta >= -8 && row_delta <= 8;
+  if (!streamer_active)
+    return;
+  plan->configured = true;
+  s_rigging_stats.configured = 1;
+  plan->bank_data = RomPtr((uint32_t)kDkc2VideoRiggingBank << 16);
+  if (!plan->bank_data ||
+      !Dkc2VideoFindTransparent2bppTile(
+          g_ppu->vram, 0x8000u,
+          (uint16_t)PPU_bgTileAdr(g_ppu, kDkc2RiggingLayer),
+          &plan->blank_entry))
+    return;
+  /*
+   * Verify the decode against the 32 fully uploaded native columns over the
+   * 28 fully visible rows. The comparison models the cartridge's own row
+   * upload quirk (Dkc2VideoRiggingCellMatches): a row DMA that inherited an
+   * increment-on-low-byte VMAIN lands every high byte one word late, which
+   * the console displays as well.
+   */
+  const uint32_t first_tile_x = plan->world_x >> 3;
+  const uint32_t top_tile_y = (plan->world_y + 1u) >> 3;
+  uint32_t expected = 0;
+  uint32_t matching = 0;
+  uint32_t shifted = 0;
+  for (uint32_t tile_y = top_tile_y; tile_y < top_tile_y + 28u; tile_y++) {
+    /* The window's first column takes its shifted high byte from the
+     * decoded cell before it, like every other column. */
+    uint16_t previous = 0;
+    bool have_previous =
+        first_tile_x > 0 &&
+        Dkc2VideoDecodeRiggingTile(plan->bank_data, 0x10000u,
+                                   (first_tile_x - 1u) * 8u, tile_y * 8u,
+                                   &previous);
+    for (uint32_t tile_x = first_tile_x; tile_x < first_tile_x + 32u;
+         tile_x++) {
+      uint16_t decoded = 0;
+      expected++;
+      if (!Dkc2VideoDecodeRiggingTile(plan->bank_data, 0x10000u,
+                                      tile_x * 8u, tile_y * 8u, &decoded)) {
+        have_previous = false;
+        continue;
+      }
+      const uint16_t ring = Dkc2RiggingRingEntry(tile_x, tile_y);
+      const bool first_in_page = (tile_x & 31u) == 0u || !have_previous;
+      if (Dkc2VideoRiggingCellMatches(decoded, ring, previous,
+                                      first_in_page)) {
+        matching++;
+        if (decoded != ring)
+          shifted++;
+      }
+      previous = decoded;
+      have_previous = true;
+    }
+  }
+  s_rigging_stats.native_expected = expected;
+  s_rigging_stats.native_matching = matching;
+  s_rigging_stats.native_shifted = shifted;
+  plan->ready = expected != 0 && matching == expected;
+  s_rigging_stats.ready = plan->ready ? 1u : 0u;
+}
+
+/* Register the rigging layer for this frame (before WsShadowFrame). */
+static void Dkc2RegisterRiggingShadow(const Dkc2RiggingPlan *plan,
+                                      int presentation_bias) {
+  if (!plan->ready)
+    return;
+  WsShadowSetWorld(kDkc2RiggingLayer, plan->world_x, plan->world_y);
+  WsShadowSetScroll(kDkc2RiggingLayer,
+                    g_ppu->hScroll[kDkc2RiggingLayer],
+                    g_ppu->vScroll[kDkc2RiggingLayer]);
+  WsShadowSetNativeViewportInset(
+      kDkc2RiggingLayer, presentation_bias < 0 ? -presentation_bias : 0,
+      presentation_bias > 0 ? presentation_bias : 0);
+  WsShadowSetWestKeep(kDkc2RiggingLayer, 8);
+  WsShadowSetEastKeep(kDkc2RiggingLayer, 8);
+  /* The row streamer's leftovers land in the store through the VRAM write
+   * capture; the exact decode must always replace them. */
+  WsShadowSetRespectGameWrites(kDkc2RiggingLayer, 0);
+  WsShadowSetBlankTile(kDkc2RiggingLayer, plan->blank_entry);
+}
+
+/* Decode every rigging cell a host margin can sample (after WsShadowFrame). */
+static void Dkc2PrefillRiggingMargins(const Dkc2RiggingPlan *plan,
+                                      int presentation_bias) {
+  if (!plan->ready)
+    return;
+  const uint32_t extra = (uint32_t)Dkc2VideoExtra();
+  const uint32_t guard = 8u;
+  const int64_t rendered =
+      (int64_t)plan->world_x + presentation_bias;
+  const uint32_t rendered_x = rendered > 0 ? (uint32_t)rendered : 0u;
+  const uint32_t west_extent = extra + guard;
+  const uint32_t first_x =
+      rendered_x > west_extent ? rendered_x - west_extent : 0u;
+  const uint32_t last_x =
+      rendered_x + (uint32_t)kDkc2VideoNativeWidth - 1u + extra + guard;
+  const uint32_t top_tile_y = (plan->world_y + 1u) >> 3;
+  const uint32_t first_tile_y = top_tile_y > 0 ? top_tile_y - 1u : 0u;
+  const uint32_t last_tile_y = top_tile_y + 29u;
+  uint32_t decoded_count = 0;
+  for (uint32_t tile_x = first_x >> 3; tile_x <= (last_x >> 3); tile_x++) {
+    for (uint32_t tile_y = first_tile_y; tile_y <= last_tile_y; tile_y++) {
+      uint16_t tile = 0;
+      if (!Dkc2VideoDecodeRiggingTile(plan->bank_data, 0x10000u,
+                                      tile_x * 8u, tile_y * 8u, &tile))
+        continue;
+      WsShadowForceTile(kDkc2RiggingLayer, tile_x, tile_y, tile);
+      decoded_count++;
+    }
+  }
+  s_rigging_stats.margin_decoded = decoded_count;
+}
+
+/*
+ * Lava geyser steam columns. The stages that run the cartridge's NMI
+ * sub-mode 18 (Red-Hot Ride's hot-air vents) keep their steam on a bounded
+ * 32x32 BG3 map that scrolls with the camera. The cartridge draws only the
+ * geysers registered in its four slots, and a bounded map wraps a geyser
+ * standing just outside the view onto the opposite edge, so the raw ring
+ * can never serve the host margins: the wrap copy is exactly the steam
+ * column that appeared over solid rock beside the view. The host decodes
+ * the stage's geyser list and the animation tables (Dkc2VideoGeyserEntry)
+ * into the world-keyed BG3 shadow store, verifies the decode against every
+ * column the cartridge has fully drawn this frame, and serves the margins
+ * plus a 24-pixel inset of each native edge (three block columns, where the
+ * cartridge's own wrap sliver lands) from that store. Every cell in that
+ * span is forced each frame, blank where no geyser stands, so a write the
+ * capture attributed to the wrap position can never linger.
+ */
+enum {
+  kDkc2GeyserLayer = kDkc2RiggingLayer,
+  kDkc2GeyserNmiSubMode = 18,
+  kDkc2GeyserSlots = 4,
+  kDkc2GeyserSlotOffsets = 0x095b,
+  kDkc2GeyserListOffset = 0x0959,
+  kDkc2GeyserFrameCounter = 0x002a,
+  kDkc2GeyserMaxListed = 16,
+  kDkc2GeyserMaxScan = 128,
+  kDkc2GeyserNativeInset = 24
+};
+
+typedef struct Dkc2GeyserPlan {
+  bool configured;           /* the stage runs the geyser effect */
+  bool ready;                /* the decode reproduced the drawn columns */
+  uint32_t world_x;          /* BG3 scroll X at the rendered PPU phase */
+  unsigned frame;            /* animation frame the ring shows */
+  const uint8_t *bank_data;  /* bank $80 from $8000 */
+  unsigned count;            /* listed geysers near the presentation */
+  uint32_t tile_x[kDkc2GeyserMaxListed]; /* leftmost block column */
+  bool tall[kDkc2GeyserMaxListed];
+} Dkc2GeyserPlan;
+
+static Dkc2GeyserStats s_geyser_stats;
+
+void Dkc2GetGeyserStats(Dkc2GeyserStats *out) {
+  if (out)
+    *out = s_geyser_stats;
+}
+
+static uint16_t Dkc2GeyserRingEntry(unsigned map_column, unsigned map_row) {
+  const uint16_t map_base =
+      (uint16_t)PPU_bgTilemapAdr(g_ppu, kDkc2GeyserLayer);
+  const uint16_t word = (uint16_t)(map_base + ((map_row & 31u) << 5) +
+                                   (map_column & 31u));
+  return g_ppu->vram[word & 0x7fffu];
+}
+
+/* Compare one registered slot's block with the decode for `frame`. A slot
+ * whose block is still entirely blank (registered this frame; the cartridge
+ * draws on its next animation tick) contributes nothing. Returns false when
+ * the slot's map offset does not describe a geyser block at all. */
+static bool Dkc2GeyserSlotMatches(const Dkc2GeyserPlan *plan,
+                                  uint16_t descriptor, unsigned frame,
+                                  uint32_t *expected, uint32_t *matching) {
+  const bool tall = (descriptor & 0x8000u) != 0u;
+  const unsigned column0 = descriptor & 31u;
+  const unsigned row0 = (descriptor >> 5) & 31u;
+  const unsigned rows = Dkc2VideoGeyserRows(tall);
+  if (row0 != Dkc2VideoGeyserFirstMapRow(tall))
+    return false;
+  bool drawn = false;
+  for (unsigned column = 0; column < kDkc2VideoGeyserColumns && !drawn;
+       column++)
+    for (unsigned row = 0; row < rows && !drawn; row++)
+      drawn = Dkc2GeyserRingEntry(column0 + column, row0 + row) != 0u;
+  if (!drawn)
+    return true;
+  for (unsigned column = 0; column < kDkc2VideoGeyserColumns; column++) {
+    for (unsigned row = 0; row < rows; row++) {
+      uint16_t decoded = 0;
+      (*expected)++;
+      if (Dkc2VideoGeyserEntry(plan->bank_data, 0x8000u, frame, tall,
+                               column, row, &decoded) &&
+          decoded == Dkc2GeyserRingEntry(column0 + column, row0 + row))
+        (*matching)++;
+    }
+  }
+  return true;
+}
+
+static void Dkc2PlanGeysers(Dkc2GeyserPlan *plan, uint8_t enabled_layers) {
+  memset(plan, 0, sizeof *plan);
+  if ((g_ppu->bgmode & 7u) != 1u ||
+      (g_ppu->bgXsc[kDkc2GeyserLayer] & 3u) != 0u ||
+      PPU_bigTiles(g_ppu, kDkc2GeyserLayer) ||
+      !(enabled_layers & 0x04u))
+    return;
+  if (Dkc2ReadWram16(0x0096) != kDkc2GeyserNmiSubMode)
+    return;
+  const uint16_t list_offset = Dkc2ReadWram16(kDkc2GeyserListOffset);
+  if ((list_offset & 1u) != 0u || list_offset >= 0x0200u)
+    return;
+  plan->configured = true;
+  s_geyser_stats.configured = 1;
+  plan->bank_data = RomPtr(0x808000u);
+  const uint8_t *list = RomPtr(kDkc2VideoGeyserListAddress + list_offset);
+  if (!plan->bank_data || !list)
+    return;
+  /* BG3 scrolls one pixel behind the camera; key it by the rendered PPU
+   * phase like the terrain owner. */
+  plan->world_x = Dkc2VideoTerrainShadowX(
+      g_ppu->hScroll[kDkc2GeyserLayer], Dkc2ReadWram16(0x17ba));
+  /*
+   * The ring shows the frame of the cartridge's last animation tick,
+   * (frame counter >> 2) & 3. Verify that prediction against every slot the
+   * cartridge has fully drawn; accept another frame only when it reproduces
+   * all of them (the counter and the ring can disagree around a tick).
+   */
+  const unsigned predicted =
+      (Dkc2ReadWram16(kDkc2GeyserFrameCounter) >> 2) & 3u;
+  s_geyser_stats.frame_predicted = (uint8_t)predicted;
+  uint16_t descriptors[kDkc2GeyserSlots];
+  for (unsigned slot = 0; slot < kDkc2GeyserSlots; slot++)
+    descriptors[slot] =
+        Dkc2ReadWram16((uint16_t)(kDkc2GeyserSlotOffsets + slot * 2u));
+  bool verified = false;
+  for (unsigned attempt = 0; attempt < kDkc2VideoGeyserFrames && !verified;
+       attempt++) {
+    const unsigned frame = (predicted + attempt) & 3u;
+    uint32_t expected = 0;
+    uint32_t matching = 0;
+    for (unsigned slot = 0; slot < kDkc2GeyserSlots; slot++) {
+      const uint16_t descriptor = descriptors[slot];
+      if (descriptor == 0u || (descriptor & 0x4000u) != 0u)
+        continue;
+      if (!Dkc2GeyserSlotMatches(plan, descriptor, frame, &expected,
+                                 &matching))
+        return;
+    }
+    if (attempt == 0 || matching == expected) {
+      s_geyser_stats.native_expected = expected;
+      s_geyser_stats.native_matching = matching;
+    }
+    if (matching == expected) {
+      plan->frame = frame;
+      verified = true;
+    }
+  }
+  if (!verified)
+    return;
+  s_geyser_stats.frame = (uint8_t)plan->frame;
+  /* Every listed geyser whose block can reach the presented window: the
+   * host margins on either side of the view, plus the presentation bias. */
+  const int64_t slack = 2 * (int64_t)Dkc2VideoExtra() + 16;
+  const int64_t first_x = (int64_t)plan->world_x - slack;
+  const int64_t last_x =
+      (int64_t)plan->world_x + kDkc2VideoNativeWidth + slack;
+  const size_t list_limit =
+      (0x10000u - ((kDkc2VideoGeyserListAddress + list_offset) & 0xffffu)) /
+      2u;
+  for (size_t index = 0; index < kDkc2GeyserMaxScan && index < list_limit;
+       index++) {
+    const uint16_t value =
+        (uint16_t)(list[index * 2u] | (list[index * 2u + 1u] << 8));
+    if (value == kDkc2VideoGeyserListEnd)
+      break;
+    uint32_t tile_x = 0;
+    if (!Dkc2VideoGeyserFirstTileX(value, &tile_x))
+      continue;
+    const int64_t block_x = (int64_t)tile_x * 8;
+    if (block_x + kDkc2VideoGeyserColumns * 8 <= first_x ||
+        block_x >= last_x)
+      continue;
+    if (plan->count >= kDkc2GeyserMaxListed)
+      break;
+    plan->tile_x[plan->count] = tile_x;
+    plan->tall[plan->count] = (value & 1u) != 0u;
+    plan->count++;
+  }
+  s_geyser_stats.margin_geysers = plan->count;
+  plan->ready = true;
+  s_geyser_stats.ready = 1;
+}
+
+/* Register the geyser layer for this frame (before WsShadowFrame). The map
+ * is periodic in Y, so world Y is the PPU scroll itself. */
+static void Dkc2RegisterGeyserShadow(const Dkc2GeyserPlan *plan,
+                                     int presentation_bias) {
+  if (!plan->ready)
+    return;
+  WsShadowSetWorld(kDkc2GeyserLayer, plan->world_x,
+                   g_ppu->vScroll[kDkc2GeyserLayer]);
+  WsShadowSetScroll(kDkc2GeyserLayer,
+                    g_ppu->hScroll[kDkc2GeyserLayer],
+                    g_ppu->vScroll[kDkc2GeyserLayer]);
+  int inset_left = presentation_bias < 0 ? -presentation_bias : 0;
+  int inset_right = presentation_bias > 0 ? presentation_bias : 0;
+  if (inset_left < kDkc2GeyserNativeInset)
+    inset_left = kDkc2GeyserNativeInset;
+  if (inset_right < kDkc2GeyserNativeInset)
+    inset_right = kDkc2GeyserNativeInset;
+  WsShadowSetNativeViewportInset(kDkc2GeyserLayer, inset_left, inset_right);
+  WsShadowSetWestKeep(kDkc2GeyserLayer, 8);
+  WsShadowSetEastKeep(kDkc2GeyserLayer, 8);
+  WsShadowSetRespectGameWrites(kDkc2GeyserLayer, 0);
+  /* The map's own empty entry, which the console shows between geysers. */
+  WsShadowSetBlankTile(kDkc2GeyserLayer, 0);
+}
+
+/* Force every margin and inset cell (after WsShadowFrame): the decoded
+ * block where a listed geyser stands, the map's empty entry elsewhere. */
+static void Dkc2PrefillGeyserMargins(const Dkc2GeyserPlan *plan,
+                                     int presentation_bias) {
+  if (!plan->ready)
+    return;
+  const int64_t extra = Dkc2VideoExtra();
+  const int64_t guard = 8;
+  int64_t rendered = (int64_t)plan->world_x + presentation_bias;
+  if (rendered < 0)
+    rendered = 0;
+  const int64_t first_x = rendered - extra - guard;
+  const int64_t last_x =
+      rendered + kDkc2VideoNativeWidth - 1 + extra + guard;
+  const int64_t interior_first = rendered + kDkc2GeyserNativeInset;
+  const int64_t interior_last =
+      rendered + kDkc2VideoNativeWidth - kDkc2GeyserNativeInset;
+  const uint32_t wy0 = (uint32_t)g_ppu->vScroll[kDkc2GeyserLayer] >> 3;
+  uint32_t forced = 0;
+  for (int64_t tile_x = first_x >> 3; tile_x <= (last_x >> 3); tile_x++) {
+    if (tile_x < 0)
+      continue;
+    const int64_t block_x = tile_x * 8;
+    if (block_x >= interior_first && block_x + 8 <= interior_last)
+      continue;
+    for (unsigned row = 0; row < 32u; row++) {
+      const uint32_t tile_y = wy0 + ((row + 32u - (wy0 & 31u)) & 31u);
+      uint16_t entry = 0;
+      for (unsigned index = 0; index < plan->count; index++) {
+        const unsigned first_row = Dkc2VideoGeyserFirstMapRow(plan->tall[index]);
+        if ((uint64_t)tile_x < plan->tile_x[index] ||
+            (uint64_t)tile_x >= plan->tile_x[index] + kDkc2VideoGeyserColumns ||
+            row < first_row || row > kDkc2VideoGeyserLastMapRow)
+          continue;
+        uint16_t decoded = 0;
+        if (Dkc2VideoGeyserEntry(plan->bank_data, 0x8000u, plan->frame,
+                                 plan->tall[index],
+                                 (unsigned)(tile_x - plan->tile_x[index]),
+                                 row - first_row, &decoded) &&
+            decoded != 0u)
+          entry = decoded;
+      }
+      WsShadowForceTile(kDkc2GeyserLayer, (uint32_t)tile_x, tile_y, entry);
+      forced++;
+    }
+  }
+  s_geyser_stats.margin_decoded = forced;
+}
+
+/* Register the terrain owner's world-keyed store (and, when another physical
+ * 64-column layer displays the same world map in some HDMA band, that layer
+ * as a read-only view of the owner's store), capture the owner's native
+ * viewport, and decode the level map into every cell a host margin can
+ * sample. Returns whether exact terrain is available for this frame. */
+static bool Dkc2PrepareWidescreenShadow(uint8_t layer_mask,
+                                        int terrain_layer,
+                                        Dkc2VideoLevelLayout layout,
+                                        int presentation_bias,
+                                        const bool alias_layer[2],
+                                        const Dkc2RiggingPlan *rigging,
+                                        const Dkc2GeyserPlan *geysers) {
+  const uint32_t camera_x = Dkc2ReadWram16(0x17BA);
+  const uint32_t camera_y = Dkc2ReadWram16(0x17C0);
+  const uint64_t source_signature = Dkc2LevelSourceSignature();
+
+  if (!s_widescreen_shadow_active) {
+    WsShadowReset();
+    s_widescreen_shadow_active = true;
+  }
+  if (!s_widescreen_source_valid ||
+      source_signature != s_widescreen_source_signature) {
+    WsShadowReset();
+    s_widescreen_source_signature = source_signature;
+    s_widescreen_source_valid = true;
+    s_hold_west_valid = false;
+    s_hold_camera_valid = false;
+    s_bias_valid = false;
+    s_hold_start_frames =
+        s_state_loaded_recently ? 0u : (uint32_t)kDkc2HoldStartFrames;
+    s_state_loaded_recently = false;
+  }
+
+  uint32_t owner_world_x = camera_x;
+  uint32_t owner_world_y = camera_y;
+  uint32_t owner_scroll_x = 0;
+  uint32_t owner_scroll_y = 0;
+  const bool have_owner =
+      terrain_layer >= 0 && terrain_layer < 2 &&
+      (layer_mask & (uint8_t)(1u << terrain_layer)) != 0;
+  if (have_owner) {
+    /*
+     * DKC2's rolling VRAM address is not its world coordinate. The layer
+     * selected by live stream destination $17B6 uses the full WRAM camera
+     * for X, but its vertical column buffer is staged one 256-pixel page
+     * above camera Y. Key Y by the rendered PPU source phase so native
+     * viewport captures, later VRAM writes, and exact prefills all address
+     * the same terrain rows. Use the PPU-latched horizontal phase for both
+     * the native viewport and widened margins: the WRAM camera can lead
+     * hScroll by 1-3 pixels while DKC2 changes direction, and keying margins
+     * from that newer value made the old 4:3 edge visibly split.
+     */
+    owner_scroll_x = s_terrain_phase_h;
+    owner_scroll_y = s_terrain_phase_v;
+    owner_world_x = Dkc2VideoTerrainShadowX(
+        (uint16_t)owner_scroll_x, camera_x);
+    owner_world_y = Dkc2VideoTerrainShadowY(
+        (uint16_t)owner_scroll_y, camera_y);
+    s_widescreen_world_x[terrain_layer] = owner_world_x;
+    s_widescreen_world_y[terrain_layer] = owner_world_y;
+    WsShadowSetWorld(terrain_layer, owner_world_x, owner_world_y);
+    WsShadowSetScroll(terrain_layer, owner_scroll_x, owner_scroll_y);
+    /* A presentation bias moves the PPU's 256-column window past the
+     * cartridge's authentic VRAM window by |bias| columns on one side. The
+     * rolling ring holds nothing authored for those columns (a stale or
+     * prefetched page), so the world-keyed store must serve them. */
+    WsShadowSetNativeViewportInset(
+        terrain_layer, presentation_bias < 0 ? -presentation_bias : 0,
+        presentation_bias > 0 ? presentation_bias : 0);
+    WsShadowSetWestKeep(terrain_layer, 8);
+    WsShadowSetEastKeep(terrain_layer, 8);
+    /* Preserve a live dynamic BG write from this or the immediately prior
+     * game frame, but do not allow stale history to defeat the verified
+     * decompressed level-map value in the widened terrain margins. */
+    WsShadowSetRespectGameWrites(terrain_layer, 1);
+    /*
+     * An unknown world cell must never fall through to a stale rolling VRAM
+     * page. Exact viewport/history captures replace this bounded fallback as
+     * soon as DKC2 displays or uploads the corresponding tile.
+     */
+    uint16_t blank_entry = 0;
+    if (!PPU_bigTiles(g_ppu, terrain_layer))
+      Dkc2VideoFindTransparent4bppTile(
+          g_ppu->vram, 0x8000u,
+          (uint16_t)PPU_bgTileAdr(g_ppu, terrain_layer), &blank_entry);
+    WsShadowSetBlankTile(terrain_layer, blank_entry);
+  }
+  for (int layer = 0; layer < 2; layer++) {
+    if (layer == terrain_layer)
+      continue;
+    if (have_owner && alias_layer[layer] &&
+        (layer_mask & (uint8_t)(1u << layer))) {
+      /* The view shares the owner's keys. The renderer adds this layer's own
+       * per-line scroll delta, so a band that leads the frame anchor by a
+       * few pixels still resolves the exact world cell. */
+      WsShadowSetEntryAlias(layer, terrain_layer,
+                            owner_world_x, owner_world_y,
+                            owner_scroll_x, owner_scroll_y);
+      WsShadowSetNativeViewportInset(
+          layer, presentation_bias < 0 ? -presentation_bias : 0,
+          presentation_bias > 0 ? presentation_bias : 0);
+    } else {
+      WsShadowClearEntryAlias(layer);
+    }
+  }
+
+  if (rigging)
+    Dkc2RegisterRiggingShadow(rigging, presentation_bias);
+  if (geysers)
+    Dkc2RegisterGeyserShadow(geysers, presentation_bias);
+  WsShadowFrame(g_ppu);
+  if (rigging)
+    Dkc2PrefillRiggingMargins(rigging, presentation_bias);
+  if (geysers)
+    Dkc2PrefillGeyserMargins(geysers, presentation_bias);
+  if (!have_owner)
+    return false;
+  return Dkc2PrefillWidescreenLevelTerrain(
+      layer_mask, terrain_layer, layout,
+      owner_world_x + presentation_bias, owner_world_x, camera_y);
+}
+
+/* Guest-address resolution for the HDMA dry run, matching the runner's
+ * SimpleHdma table walk: WRAM banks, the low-RAM mirror, and ROM. */
+static const uint8_t *Dkc2HdmaPointer(void *context, uint32_t address) {
+  (void)context;
+  const uint8_t bank = (uint8_t)(address >> 16);
+  const uint16_t offset = (uint16_t)address;
+  if (bank == 0x7e)
+    return g_ram + offset;
+  if (bank == 0x7f)
+    return g_ram + 0x10000 + offset;
+  if ((bank < 0x40 || (bank >= 0x80 && bank < 0xc0)) && offset < 0x2000)
+    return g_ram + offset;
+  return RomPtr(address);
+}
+
+static bool Dkc2HdmaReadable(void *context, const uint8_t *pointer,
+                             size_t length) {
+  (void)context;
+  if (!pointer)
+    return false;
+  const uintptr_t address = (uintptr_t)pointer;
+  const uintptr_t ram_base = (uintptr_t)g_ram;
+  if (address >= ram_base) {
+    const size_t offset = (size_t)(address - ram_base);
+    if (offset <= sizeof g_ram && length <= sizeof g_ram - offset)
+      return true;
+  }
+  const uint32_t rom_size =
+      g_snes && g_snes->cart ? (uint32_t)g_snes->cart->romSize : 0;
+  const uintptr_t rom_base = (uintptr_t)g_rom;
+  if (g_rom && rom_size != 0 && address >= rom_base) {
+    const size_t offset = (size_t)(address - rom_base);
+    if (offset <= rom_size && length <= (size_t)rom_size - offset)
+      return true;
+  }
+  return false;
+}
+
+static void Dkc2ScanFrameBands(Dkc2HdmaBands *bands) {
+  Dkc2HdmaChannelConfig channels[8];
+  for (int index = 0; index < 8; index++) {
+    const DmaChannel *channel = &g_dma->channel[index];
+    channels[index].active =
+        (g_snesrecomp_last_hdmaen & (uint8_t)(1u << index)) != 0;
+    channels[index].indirect = channel->indirect;
+    channels[index].b_address = channel->bAdr;
+    channels[index].mode = channel->mode;
+    channels[index].indirect_bank = channel->indBank;
+    channels[index].table_address =
+        (uint32_t)channel->aAdr | ((uint32_t)channel->aBank << 16);
+  }
+  Dkc2HdmaFrameState start;
+  memcpy(start.h_scroll, g_ppu->hScroll, sizeof start.h_scroll);
+  memcpy(start.v_scroll, g_ppu->vScroll, sizeof start.v_scroll);
+  start.main_layers = g_ppu->screenEnabled[0];
+  start.sub_layers = g_ppu->screenEnabled[1];
+  memcpy(start.bg_sc, g_ppu->bgXsc, sizeof start.bg_sc);
+  start.scroll_prev = g_ppu->scrollPrev;
+  start.scroll_prev2 = g_ppu->scrollPrev2;
+  const Dkc2HdmaMemory memory = {
+      Dkc2HdmaPointer, Dkc2HdmaReadable, NULL};
+  Dkc2HdmaScanBands(channels, &start, &memory, bands);
+}
+
+/* Decide, for every wide BG1/BG2 layer and every scanline band, whether the
+ * layer displays the streamed world map (terrain phase, relative to the
+ * scroll the owner rendered at the frame anchor) or a bounded effect plane.
+ * Either physical layer may hold either role in any band. */
+static void Dkc2ClassifyBands(uint8_t wide_layer_mask,
+                              int terrain_layer,
+                              const Dkc2HdmaBands *bands,
+                              uint8_t policy[2][kDkc2HdmaMaxBands],
+                              bool alias_layer[2]) {
+  const bool have_owner = terrain_layer >= 0 && terrain_layer < 2;
+  const uint16_t terrain_h = have_owner ? s_terrain_phase_h : 0;
+  const uint16_t terrain_v = have_owner ? s_terrain_phase_v : 0;
+  const uint16_t stream_base =
+      (uint16_t)(Dkc2ReadWram16(0x17B6) & 0xfc00u);
+  const int32_t camera_x = (int32_t)Dkc2ReadWram16(0x17BA);
+  const int32_t camera_y = (int32_t)Dkc2ReadWram16(0x17C0);
+  Dkc2TrackVramPages(camera_x, camera_y);
+  for (int layer = 0; layer < 2; layer++) {
+    alias_layer[layer] = false;
+    s_plane_band_count[layer] = 0;
+    const bool wide = (wide_layer_mask & (uint8_t)(1u << layer)) != 0;
+    for (int index = 0; index < bands->count; index++) {
+      const Dkc2HdmaBand *band = &bands->band[index];
+      const bool world =
+          have_owner && wide &&
+          Dkc2VideoScrollAtTerrainPhase(
+              band->h_scroll[layer], band->v_scroll[layer],
+              terrain_h, terrain_v);
+      const bool plane =
+          !world && wide &&
+          Dkc2BandShowsStaticPlane(band->bg_sc[layer], stream_base, layer,
+                                   band->v_scroll[layer], band->first_line,
+                                   band->last_line);
+      policy[layer][index] = world ? kDkc2BandPolicyWorld
+                             : plane ? kDkc2BandPolicyPlane
+                                     : kDkc2BandPolicyRepeat;
+      if (plane)
+        s_plane_band_count[layer]++;
+      if (world && layer != terrain_layer)
+        alias_layer[layer] = true;
+    }
+  }
+  /* DKC2_BAND_DUMP=1: print every scanline band's scrolls, tilemap
+   * register, and the policy chosen for each wide layer (W world, P plane,
+   * R repeat, - not wide) to stderr each frame. A band whose policy
+   * alternates between frames shows as a strip that changes texture. */
+  if (getenv("DKC2_BAND_DUMP")) {
+    fprintf(stderr, "bands %d frame %u:", bands->count, s_plane_frame);
+    for (int index = 0; index < bands->count; index++) {
+      const Dkc2HdmaBand *band = &bands->band[index];
+      fprintf(stderr, " [%u-%u", band->first_line, band->last_line);
+      for (int layer = 0; layer < 2; layer++) {
+        const bool wide = (wide_layer_mask & (uint8_t)(1u << layer)) != 0;
+        fprintf(stderr, " %c%02x/%u,%u",
+                !wide ? '-'
+                : policy[layer][index] == kDkc2BandPolicyWorld ? 'W'
+                : policy[layer][index] == kDkc2BandPolicyPlane ? 'P' : 'R',
+                band->bg_sc[layer], band->h_scroll[layer],
+                band->v_scroll[layer]);
+      }
+      fputc(']', stderr);
+    }
+    fputc('\n', stderr);
+  }
+}
+
+static void Dkc2ApplyBandPolicies(const Dkc2HdmaBand *band,
+                                  int band_index,
+                                  uint8_t wide_layer_mask) {
+  for (unsigned layer = 0; layer < 2; layer++) {
+    if (!(wide_layer_mask & (uint8_t)(1u << layer)))
+      continue;
+    const uint8_t policy =
+        band && band_index >= 0 ? s_band_policy[layer][band_index]
+                                : (uint8_t)kDkc2BandPolicyWorld;
+    if (policy == kDkc2BandPolicyRepeat) {
+      PpuSetWidescreenLayerRepeatBand(
+          g_ppu, (uint8_t)layer, band->first_line,
+          (uint8_t)(band->last_line + 1u));
+      PpuSetWidescreenLayerRawBand(g_ppu, (uint8_t)layer, 0, 0);
+    } else if (policy == kDkc2BandPolicyPlane) {
+      PpuSetWidescreenLayerRepeatBand(g_ppu, (uint8_t)layer, 0, 0);
+      PpuSetWidescreenLayerRawBand(
+          g_ppu, (uint8_t)layer, band->first_line,
+          (uint8_t)(band->last_line + 1u));
+    } else {
+      PpuSetWidescreenLayerRepeatBand(g_ppu, (uint8_t)layer, 0, 0);
+      PpuSetWidescreenLayerRawBand(g_ppu, (uint8_t)layer, 0, 0);
+    }
+  }
+}
+
+void Dkc2DrawPpuFrame(void) {
+  SimpleHdma channels[8];
+  bool active[8] = {false};
+  const Dkc2VideoLevelLayout layout =
+      Dkc2VideoLevelLayoutForScene(
+          Dkc2ReadWram16(0x0529), Dkc2ReadWram16(0x00d3));
+
+  /*
+   * Widescreen is a host-only PPU policy. Reapply it for every frame because
+   * reset/state restore deliberately does not serialize presentation
+   * geometry.
+   */
+  uint8_t wide_layer_mask =
+      Dkc2VideoIsWidescreen()
+          ? Dkc2VideoPpuWideLayerMask(g_ppu->bgmode, g_ppu->bgXsc,
+                                      g_ppu->screenEnabled[0],
+                                      g_ppu->screenEnabled[1])
+          : 0;
+  if (layout == kDkc2VideoLevelLayoutUnknown)
+    wide_layer_mask = 0;
+  /*
+   * A level-name card (NMI sub-mode 11 inside the gameplay mode) is a static
+   * picture on bounded maps with no camera and no terrain stream, whatever
+   * its map size. It is presented like every bounded screen, centered
+   * between black margins, never through the terrain path: nothing authored
+   * exists beyond its 256 columns (the 64-column cards hold a wider painting
+   * on the right but only the map's wrap on the left), and the owner
+   * prefers black to mirrored or wrapped art there.
+   */
+  const bool name_card =
+      Dkc2VideoIsWidescreen() && Dkc2ReadWram16(0x0024) == 0x8819u &&
+      Dkc2ReadWram16(0x0096) == kDkc2NameCardNmiSubMode &&
+      (g_ppu->bgmode & 7u) == 1u &&
+      ((g_ppu->screenEnabled[0] | g_ppu->screenEnabled[1]) & 0x07u) != 0u;
+  const bool extend_world = wide_layer_mask != 0 && !name_card;
+  int presentation_bias = 0;
+  bool band_policies_active = false;
+  bool blank_margins = false;
+  /* Reset host presentation latches before deriving the current frame. A
+   * prior gameplay scene must not leave a physically wide BG3 enabled on a
+   * bounded title, menu, or unsupported layout. */
+  PpuSetWidescreenLayerMask(g_ppu, 0);
+  PpuSetWidescreenBg3Widen(g_ppu, 0);
+  PpuSetWidescreenPresentationXBias(g_ppu, 0);
+  s_frame_bands.count = 0;
+  memset(&s_rigging_stats, 0, sizeof s_rigging_stats);
+  memset(&s_geyser_stats, 0, sizeof s_geyser_stats);
+  if (extend_world) {
+    const int extra = Dkc2VideoExtra();
+    PpuSetExtraSpace(g_ppu, (uint8_t)extra);
+    const uint16_t camera_x = Dkc2ReadWram16(0x17BA);
+    const uint16_t maximum_scroll_x = Dkc2ReadWram16(0x0AFC);
+    int bias = 0;
+    int left_margin = extra;
+    int right_margin = extra;
+    /* The level's west bound: the map's first page unless the last prefill
+     * found the player held at the authored world's edge with nothing
+     * beside it (Dkc2VideoHoldWest). The bias then moves at most one pixel
+     * a frame toward the glide's target. */
+    const uint16_t minimum_scroll_x =
+        s_hold_west_valid && s_hold_west_x > 0x100u &&
+                s_hold_west_x <= camera_x
+            ? (uint16_t)s_hold_west_x : 0x0100u;
+    int wanted_bias = 0;
+    Dkc2VideoPresentationMarginsBounded(camera_x, minimum_scroll_x,
+                                        maximum_scroll_x, &wanted_bias,
+                                        &left_margin, &right_margin);
+    if (!s_bias_valid) {
+      s_bias_presented = wanted_bias;
+      s_bias_frames = 0;
+    } else if (s_bias_frames < (uint32_t)kDkc2BiasSettleFrames) {
+      s_bias_presented = wanted_bias;
+    } else if (wanted_bias > s_bias_presented) {
+      s_bias_presented++;
+    } else if (wanted_bias < s_bias_presented) {
+      s_bias_presented--;
+    }
+    s_bias_valid = true;
+    if (s_bias_frames < 0xffffffffu)
+      s_bias_frames++;
+    bias = s_bias_presented;
+    Dkc2VideoMarginsForBias(camera_x, minimum_scroll_x, maximum_scroll_x,
+                            bias, &left_margin, &right_margin);
+    const int terrain_layer = Dkc2VideoTerrainLayer(
+        wide_layer_mask, g_ppu->bgXsc, Dkc2ReadWram16(0x17B6));
+    /* The cartridge has already built this frame's HDMA tables. Read the
+     * exact scanline geometry from them before drawing. */
+    Dkc2ScanFrameBands(&s_frame_bands);
+    /* The terrain phase the frame renders: the frame-start register unless
+     * the cartridge left it off the camera and its HDMA sets the camera
+     * phase on the rendered lines. */
+    s_terrain_phase_h = terrain_layer >= 0 ? g_ppu->hScroll[terrain_layer] : 0;
+    s_terrain_phase_v = terrain_layer >= 0 ? g_ppu->vScroll[terrain_layer] : 0;
+    s_terrain_phase_from_band =
+        terrain_layer >= 0 &&
+        Dkc2VideoSelectTerrainPhase(&s_frame_bands, terrain_layer,
+                                    s_terrain_phase_h, s_terrain_phase_v,
+                                    camera_x, Dkc2ReadWram16(0x17C0),
+                                    &s_terrain_phase_h, &s_terrain_phase_v);
+    /* Screen enables as the union of the frame start and every HDMA band:
+     * the repeat policy and the geyser effect gate both need a layer the
+     * cartridge switches on only inside a band (the lava surface). */
+    uint8_t band_main_layers = g_ppu->screenEnabled[0];
+    uint8_t band_sub_layers = g_ppu->screenEnabled[1];
+    for (int index = 0; index < s_frame_bands.count; index++) {
+      band_main_layers =
+          (uint8_t)(band_main_layers | s_frame_bands.band[index].main_layers);
+      band_sub_layers =
+          (uint8_t)(band_sub_layers | s_frame_bands.band[index].sub_layers);
+    }
+    Dkc2RiggingPlan rigging;
+    Dkc2PlanRigging(&rigging);
+    Dkc2GeyserPlan geysers;
+    Dkc2PlanGeysers(&geysers,
+                    (uint8_t)(band_main_layers | band_sub_layers));
+    bool alias_layer[2] = {false, false};
+    Dkc2ClassifyBands(wide_layer_mask, terrain_layer, &s_frame_bands,
+                      s_band_policy, alias_layer);
+    /* WsShadow owns only BG1/BG2 terrain. Establish exact terrain readiness
+     * before allowing any additional physical layer into the final render
+     * mask; this keeps 64-column HUD/staging allocations fail-closed. */
+    PpuSetWidescreenLayerMask(g_ppu, wide_layer_mask);
+    const bool terrain_ready = Dkc2PrepareWidescreenShadow(
+        wide_layer_mask, terrain_layer, layout, bias, alias_layer,
+        &rigging, &geysers);
+    presentation_bias = terrain_ready ? bias : 0;
+    /* Nothing authored reaches the margins while the world is unproven (a
+     * level intro's static picture, the first frames of a stream), and the
+     * PPU would otherwise fill them with the backdrop color, which Barrel
+     * Bayou's intro sets to pure blue. Show black there, as a bounded
+     * screen does, never the backdrop. */
+    blank_margins = !terrain_ready;
+    PpuSetWidescreenPresentationXBias(g_ppu, presentation_bias);
+    Dkc2VideoSetPresentationBias(presentation_bias);
+    if (terrain_ready)
+      PpuSetExtraSideSpace(g_ppu, left_margin, right_margin, 0);
+    uint8_t physical_wide_mask =
+        terrain_ready
+            ? Dkc2VideoPhysicalWideLayerMask(
+                  g_ppu->bgmode, g_ppu->bgXsc,
+                  g_ppu->screenEnabled[0], g_ppu->screenEnabled[1])
+            : 0;
+    /* A mirrored margin at a level wall has no authored BG3 ring columns to
+     * expose. Within one margin of a wall, a physical 64-column BG3 repeats
+     * its rendered line like a bounded layer instead of reading the ring. */
+    if (Dkc2VideoMarginLeavesAuthoredExtent(camera_x, maximum_scroll_x))
+      physical_wide_mask = (uint8_t)(physical_wide_mask & ~0x04u);
+    /* A ship-deck rigging BG3 whose ROM decode did not reproduce the
+     * native window this frame shows no margin rather than the ring's
+     * stale or recycled columns. */
+    if (rigging.configured && !rigging.ready)
+      physical_wide_mask = (uint8_t)(physical_wide_mask & ~0x04u);
+    /* A bounded geyser BG3 whose decode reproduced every drawn column
+     * renders its margins from the world-keyed store like a rolling layer;
+     * a geyser stage whose decode failed shows no BG3 margin at all rather
+     * than the map's 256-pixel wrap (it is kept out of the repeat policy
+     * below). */
+    if (terrain_ready && geysers.ready)
+      physical_wide_mask = (uint8_t)(physical_wide_mask | 0x04u);
+    const uint8_t repeat_exempt_mask =
+        (uint8_t)(geysers.configured ? 0x04u : 0u);
+    const uint8_t render_layer_mask =
+        (uint8_t)(wide_layer_mask | physical_wide_mask);
+    PpuSetWidescreenLayerMask(g_ppu, render_layer_mask);
+    /* The shared PPU has a separate clamp for BG3. Any enabled physical
+     * 64-column BG3 may use authentic adjacent columns after terrain is
+     * proven ready. */
+    PpuSetWidescreenBg3Widen(
+        g_ppu, (physical_wide_mask & 0x04u) != 0 ? 1u : 0u);
+    /*
+     * Every enabled bounded (32-column) background repeats its rendered
+     * native scanline into the margins. That is exactly what a wider PPU
+     * would draw from a map that wraps at 256 pixels, including its HDMA
+     * phase, windows, and color-math participation. Rolling 64-column
+     * layers are handled per scanline band below.
+     */
+    /*
+     * A bounded layer the cartridge enables only inside an HDMA band (the
+     * ship hold's BG3 water surface: TM is zero at frame start and the
+     * band switches BG3 on for its scanlines) must repeat like one enabled
+     * for the whole frame, or the band draws only the native 256 columns
+     * and the surface line stops at the 4:3 edges. The repeat policy is
+     * derived from the union of every band's screen enables.
+     */
+    PpuSetWidescreenLayerRepeat(
+        g_ppu, Dkc2VideoRepeatLayerMask(
+                   g_ppu->bgmode, band_main_layers, band_sub_layers,
+                   (uint8_t)(render_layer_mask | repeat_exempt_mask)));
+    /*
+     * A 32-column map wraps at 256 pixels on hardware, so its rendered line
+     * repeats at exactly that period and shows whatever seam the authored
+     * plane has at its wrap, as the console does once the layer scrolls.
+     * Only a bounded backdrop kept in a 64-column allocation (the ship-hold
+     * cabin wall) has no hardware wrap to fall back on; those lines
+     * continue at the period their own rendered interior proves, and their
+     * seven stale fine-scroll endpoints are rebuilt from that period.
+     */
+    PpuSetWidescreenLayerRepeatAutoPeriod(g_ppu, wide_layer_mask,
+                                          wide_layer_mask);
+    if (terrain_ready) {
+      band_policies_active = true;
+    } else {
+      /* An unproven rolling layer shows no margin content at all rather
+       * than raw recycled VRAM. Bounded layers still repeat. */
+      PpuSetWidescreenLayerClamp(g_ppu, wide_layer_mask);
+    }
+    Dkc2VideoSetTerrainReady(terrain_ready);
+  } else if (Dkc2VideoIsWidescreen()) {
+    Dkc2ResetWidescreenShadow();
+    /*
+     * Clear the whole host row before centering a bounded 256-column screen.
+     * PpuSetExtraSpaceCentered intentionally draws no margin pixels, so this
+     * prevents the preceding wide gameplay frame from surviving there.
+     */
+    size_t row_bytes = (size_t)Dkc2VideoWidth() * kDkc2VideoBytesPerPixel;
+    for (int y = 0; y < kDkc2VideoHeight; y++)
+      memset(g_ppu->renderBuffer + (size_t)y * g_ppu->renderPitch,
+             0, row_bytes);
+    PpuSetExtraSpaceCentered(g_ppu, (uint8_t)Dkc2VideoExtra());
+  } else {
+    Dkc2ResetWidescreenShadow();
+    PpuSetExtraSpace(g_ppu, 0);
+  }
+
+  dma_startDma(g_dma, g_snesrecomp_last_hdmaen, true);
+  for (int channel = 0; channel < 8; channel++) {
+    active[channel] = g_dma->channel[channel].hdmaActive;
+    if (active[channel])
+      SimpleHdma_Init(&channels[channel], &g_dma->channel[channel]);
+  }
+
+  const Dkc2HdmaBand *current_band = NULL;
+  for (int line = 0; line <= 224; line++) {
+    if (band_policies_active) {
+      const Dkc2HdmaBand *band = Dkc2HdmaBandForLine(&s_frame_bands, line);
+      if (band != current_band) {
+        current_band = band;
+        Dkc2ApplyBandPolicies(
+            band, band ? (int)(band - s_frame_bands.band) : -1,
+            wide_layer_mask);
+      }
+    }
+    if (presentation_bias != 0) {
+      for (unsigned layer = 0; layer < 4; layer++)
+        g_ppu->hScroll[layer] =
+            (uint16_t)(g_ppu->hScroll[layer] + presentation_bias);
+    }
+    ppu_runLine(g_ppu, line);
+    if (presentation_bias != 0) {
+      for (unsigned layer = 0; layer < 4; layer++)
+        g_ppu->hScroll[layer] =
+            (uint16_t)(g_ppu->hScroll[layer] - presentation_bias);
+    }
+    for (int channel = 0; channel < 8; channel++) {
+      if (active[channel]) SimpleHdma_DoLine(&channels[channel]);
+    }
+  }
+  if (band_policies_active) {
+    for (unsigned layer = 0; layer < 3; layer++) {
+      PpuSetWidescreenLayerRepeatBand(g_ppu, (uint8_t)layer, 0, 0);
+      PpuSetWidescreenLayerRawBand(g_ppu, (uint8_t)layer, 0, 0);
+    }
+  }
+  if (blank_margins) {
+    const size_t extra = (size_t)Dkc2VideoExtra();
+    const size_t width = (size_t)Dkc2VideoWidth();
+    if (extra > 0 && width >= (size_t)kDkc2VideoNativeWidth + 2 * extra) {
+      const size_t side_bytes = extra * kDkc2VideoBytesPerPixel;
+      const size_t right_offset =
+          (width - extra) * kDkc2VideoBytesPerPixel;
+      for (int y = 0; y < kDkc2VideoHeight; y++) {
+        uint8_t *row = g_ppu->renderBuffer + (size_t)y * g_ppu->renderPitch;
+        memset(row, 0, side_bytes);
+        memset(row + right_offset, 0, side_bytes);
+      }
+    }
+  }
+
+  /* The static-recomp host advances one complete game frame and one complete
+   * render pass as separate operations. Model the VBlank boundary after the
+   * visible lines so the PPU reloads its internal OAM port from OAMADD before
+   * the next frame's NMI performs DKC2's 544-byte OAM DMA. Without this call,
+   * the DMA source is correct but the destination begins at the stale address
+   * left by the preceding transfer and the sprite table rotates every frame. */
+  (void)ppu_checkOverscan(g_ppu);
+  ppu_handleVblank(g_ppu);
+}
+
+uint32_t Dkc2ResumePc(void) {
+  return s_resume_pc;
+}
+
+int Dkc2LastLleResult(void) {
+  return s_last_lle_result;
+}
+
+/* Required neutral hooks declared by generated funcs.h. */
+void RunOneFrameOfGame_Internal(void) {
+  Dkc2RunOneFrame();
+}
+
+void ResetSpritesFunc(int first) {
+  (void)first;
+}

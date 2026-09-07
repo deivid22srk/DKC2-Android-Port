@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DKC2Recomp</string>
+    <string name="rom_required">Selecione a ROM do jogo (DKC2 USA v1.0) para jogar</string>
+    <string name="rom_ready">ROM selecionada. Iniciando…</string>
+    <string name="rom_invalid">Arquivo muito pequeno para ser uma ROM de SNES</string>
+    <string name="rom_replace_failed">Não foi possível substituir a ROM anterior</string>
+    <string name="no_file_picker">Nenhum seletor de arquivos disponível</string>
+</resources>

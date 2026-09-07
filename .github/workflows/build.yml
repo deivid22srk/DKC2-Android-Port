@@ -1,0 +1,114 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with pinned snesrecomp submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust (native snesrecomp analyzer)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Android SDK components
+        run: |
+          set -euo pipefail
+          SDKM="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.31.6"
+
+      - name: Fetch the verified ROM from the private archive
+        id: rom
+        env:
+          ROM_TOKEN: ${{ secrets.ROM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ROM_TOKEN}" ]; then
+            echo "::error::Missing secret ROM_TOKEN (a GitHub token with access to deivid22srk/DKC2Recomp-Archive)."
+            exit 1
+          fi
+          # Release asset id 547932024 = "Donkey Kong Country 2 - Diddy's Kong
+          # Quest (USA) (En,Fr).sfc" zipped (the exact SHA-256 the recomp pins).
+          curl -fsSL \
+            -H "Authorization: Bearer ${ROM_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            -o rom.zip \
+            "https://api.github.com/repos/deivid22srk/DKC2Recomp-Archive/releases/assets/547932024"
+          rm -rf romdir && mkdir romdir
+          unzip -o -q rom.zip -d romdir
+          ROM="$(find romdir -type f \( -name '*.sfc' -o -name '*.smc' \) | head -n 1)"
+          if [ -z "${ROM}" ]; then
+            echo "::error::No .sfc/.smc found inside the downloaded archive."
+            exit 1
+          fi
+          ACTUAL="$(sha256sum "${ROM}" | cut -d' ' -f1)"
+          EXPECTED="35421a9af9dd011b40b91f792192af9f99c93201d8d394026bdfb42cbf2d8633"
+          SIZE="$(stat -c%s "${ROM}")"
+          echo "ROM: ${ROM} (${SIZE} bytes)"
+          echo "SHA-256: ${ACTUAL}"
+          if [ "${ACTUAL}" != "${EXPECTED}" ] || [ "${SIZE}" != "4194304" ]; then
+            echo "::error::The archived ROM is not the supported DKC2 USA v1.0 baseline (expected SHA-256 ${EXPECTED}, 4194304 bytes). Re-upload the verified dump to the private archive."
+            exit 1
+          fi
+          echo "rom=${ROM}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate private snesrecomp sources
+        run: |
+          python3 scripts/generate_snesrecomp.py \
+            --rom "${{ steps.rom.outputs.rom }}" \
+            --analysis-backend native
+          echo "Generated source files: $(ls generated/snesrecomp | wc -l)"
+
+      - name: Build debug and release APKs (arm64-v8a)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DKC2Recomp-Android-apks
+          if-no-files-found: error
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Job summary
+        run: |
+          {
+            echo "## DKC2Recomp Android build"
+            echo ""
+            echo "| Artifact | Size |"
+            echo "| --- | --- |"
+            echo "| app-debug.apk | $(stat -c%s android/app/build/outputs/apk/debug/app-debug.apk) bytes |"
+            echo "| app-release.apk | $(stat -c%s android/app/build/outputs/apk/release/app-release.apk) bytes |"
+            echo ""
+            echo "Release APK is signed with the CI fallback (debug) key unless"
+            echo "DKC2_RELEASE_STORE_FILE / DKC2_RELEASE_STORE_PASSWORD /"
+            echo "DKC2_RELEASE_KEY_ALIAS / DKC2_RELEASE_KEY_PASSWORD secrets are set."
+          } >> "$GITHUB_STEP_SUMMARY"

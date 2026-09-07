@@ -1,0 +1,1351 @@
+# Architecture
+
+## Distribution boundary
+
+The public source tree contains original tools, runtime code, tests, and
+documentation. It never contains the game ROM, extracted game content, or
+generated copyrighted data. Private products live beneath ignored `build`,
+`private`, or `generated` directories.
+
+## Target execution model
+
+The intended first playable implementation combines translation with a tested
+fallback:
+
+1. Verify the user's ROM locally.
+2. Decode reachable W65C816 code and build control-flow graphs.
+3. Execute uncertain paths in the portable interpreter.
+4. Emit native C for proven direct control flow and known calls.
+5. Link both to a portable SNES hardware layer.
+6. Replace translated routines with readable C subsystem by subsystem.
+
+The interpreter is now functional and is the behavioral bootstrap for the
+translator. It is not the final performance strategy.
+
+## Static analysis layer
+
+`dkc2_analyze` tracks processor mode and M/X operand widths, follows direct
+branches and jumps, and can record or traverse direct calls. It recognizes
+DKC2's `PEA`/`RTS` startup trampoline using a small abstract return-word stack.
+Indirect jumps and unknown stack effects end a path rather than inviting a
+guess.
+
+An external WLA symbol map may be overlaid and a Graphviz DOT graph exported.
+Neither is needed at runtime or included in releases.
+
+SNESRecomp's active function names live in the source-owned `recomp/bank*.cfg`
+files, not in the ignored WLA overlay. The CFG set already carries the broad
+revision-0 names imported during structural analysis. The optional
+`scripts/promote_snesrecomp_symbols.py` pass expands a residual generic name
+only when a private overlay provides one unambiguous contextual alias that
+ends in the same full `CODE_BBXXXX` identity. Matching that embedded identity,
+rather than the CFG range start, is required because conditional assembly can
+move the revision-0 routine while a research label still contains a different
+revision's address. Data aliases, bank mismatches, name collisions, and
+ambiguous contexts fail closed. `recomp/funcs.h` and private generated C are
+then regenerated from the updated CFG; this changes diagnostic readability,
+not guest execution or hardware state.
+
+The durable semantic layer is split deliberately:
+
+1. `recomp/bank*.cfg` remains authoritative for structural function
+   boundaries and dispatch contracts.
+2. `recomp/symbols.toml` records curated function meaning by the exact
+   supported-ROM `BB:OOOO` boundary. Revision-dependent historical names are
+   aliases, never identities.
+3. `recomp/layouts.toml` records confirmed WRAM objects, array dimensions,
+   structures, and field offsets.
+4. `scripts/build_dkc2_symbol_database.py` validates the layers, applies
+   exact-address names to CFG, and generates diagnostic constants, a readable
+   reference, and an ignored complete JSON inventory.
+
+The generator rejects missing boundaries, name/address collisions, invalid
+WRAM ranges, unknown field widths, duplicate constants, and overlapping
+fields. `--check` makes stale tracked projections a test failure. Discovery
+therefore accumulates in reviewed metadata instead of ignored generated C.
+
+## CPU execution layer
+
+`dkc2_cpu_step` executes one complete logical W65C816 instruction against
+generic 24-bit read/write callbacks. The register file includes A, X, Y, S, D,
+PC, DBR, PBR, P, E, wait/stop state, and an instruction counter. Reset, NMI,
+and IRQ entry points use the same callback boundary.
+
+Every opcode and addressing mode is implemented, including decimal arithmetic,
+native/emulation transitions, interrupt frames, long pointers, stack
+exceptions, and complete block moves. The core passed 5,080,000 external
+instruction-state comparisons. It is not cycle accurate: one step does not
+expose dummy accesses or internal block-move iterations.
+
+## Address-space layer
+
+`dkc2_hirom_snes_to_rom` recognizes ROM windows only:
+
+- `$40-$7D:0000-FFFF`
+- `$C0-$FF:0000-FFFF`
+- `$00-$3F:8000-FFFF`
+- `$80-$BF:8000-FFFF`
+
+`dkc2_bus` separately routes full WRAM, its low mirrors, DKC2's 2 KiB SRAM
+mirrors, I/O callbacks, ROM, and unmapped/open-bus accesses. This keeps mapper
+logic from silently treating hardware registers as ROM.
+
+## Bring-up hardware layer
+
+`dkc2_snes_io` currently provides:
+
+- CPU and DMA register storage;
+- PPU register storage;
+- VRAM address/remap/increment and low/high data ports;
+- CGRAM data ports and the OAM word-address/write-latch behavior used by the
+  renderer;
+- shared background scroll-offset latching and PPU-mode telemetry;
+- the `$2180-$2183` 17-bit WRAM address and auto-incrementing data port;
+- the shared `$211B-$2120` Mode-7 write latch and signed multiply result;
+- delayed CPU multiplication/division and `$4214-$4217` results;
+- all eight general-DMA B-bus offset patterns;
+- fixed, incrementing, and decrementing A-bus sources;
+- the four CPU/APU communication ports;
+- an opt-in master-cycle event timeline with NTSC H/V counters;
+- NMI/TIMEUP status, interrupt latches, and `WAI` wake-up support;
+- direct and indirect HDMA for all eight transfer patterns;
+- two serial controllers and timed automatic polling; and
+- explicit barriers for unsupported I/O and B-to-A DMA.
+
+This is enough to execute DKC2's reset initialization and exact 65,536-byte
+fixed-source VRAM clear. The default probe can still stop at the first SPC700
+IPL handshake for regression compatibility; `--with-apu` continues with the
+executing APU. Richer PPU reads, access restrictions, several display modes,
+and exact CPU/bus cycles remain future components.
+
+## Headless PPU rendering layer
+
+`dkc2_ppu_renderer` is an optional observer of `dkc2_snes_io`. At visible
+HBlank it snapshots the just-completed scanline before that line's HDMA
+updates. At the end of the visible region it publishes a complete 512x224 RGB
+frame and a deterministic SHA-256 fingerprint.
+
+The renderer implements tiled backgrounds for modes 0, 1, 3, and 5; Mode-7
+BG1 and EXTBG affine sampling; 2/4/8-bpp planar tiles; map, tile, and Mode-7
+screen flips; layer and tile priority; low- and high-resolution output; all
+object-size pairs; object priority rotation and scanline range/time limits;
+and main/subscreen color math. Unsupported state is recorded in a feature mask
+instead of silently claiming a fully supported frame. The current unsupported
+set includes modes 2/4/6, windows, direct color, mosaic, pseudo-hires, and
+interlace.
+
+Rendering is opt-in so the existing CPU, APU, and timing checkpoints retain
+their cost and behavior. `--frame-output=<private.ppm>` is also opt-in and
+writes only to the caller's path; no ROM-derived image belongs in source
+control. See `docs/PPU_RENDERING.md` for supported state and validation rules.
+
+## Timing and event layer
+
+`dkc2_snes_io_advance_master_cycles` is the common clock input for beam
+progression, NMI/IRQ latches, HDMA, autojoy, delayed CPU math, and the APU. The
+current boot adapter counts all host-visible A-bus byte accesses and assigns
+eight master cycles to each. That adapter is intentionally replaceable: when
+the CPU core later reports exact cycles, the hardware event API does not need
+to change.
+
+The compatibility modes are layered. The default stops at the original APU
+barrier, `--with-apu` retains the port-access scheduler and `$4211` checkpoint,
+`--with-timing` selects the event path, and `--with-render` adds scanline
+capture and framebuffer publication to it. See
+`docs/TIMING_AND_INTERRUPTS.md` for the complete contract and limitations.
+
+## APU execution layer
+
+`dkc2_apu` wraps the MIT-licensed LakeSnes SPC700/S-DSP subset. The wrapper
+owns reset/execution, CPU-side port access, ARAM inspection, and cycle counts;
+LakeSnes types do not escape the wrapper API. S-SMP registers, IPL ROM, timers,
+DSP registers, BRR decoding, and sample generation are present.
+
+The compatibility scheduler advances one complete SPC opcode per 65816 APUIO
+access in `--with-apu` mode. The timed continuation instead derives SPC cycles
+from the master timeline at a nominal 21:1 ratio and carries whole-instruction
+overshoot as debt. CPU-to-master timing is still provisional, so audio timing
+and race behavior cannot yet be called accurate.
+
+## Current boot sequence
+
+With zeroed host WRAM/SRAM and the NTSC status bit selected, `dkc2_boot`:
+
+1. enters the ROM reset vector;
+2. completes DKC2's RAM, SRAM, region, and startup checks;
+3. initializes PPU, CPU, and DMA registers;
+4. executes channel-0 DMA and verifies all 64 KiB of VRAM are zero;
+5. clears both WRAM banks through two logical MVN instructions; and
+6. reaches the SPC700 IPL-ready comparison at `$B5:821A`.
+
+The measured checkpoint is 74,262 interpreted instructions, one 65,536-byte
+DMA, and an explicit APU barrier. This is a deterministic bring-up regression,
+not a console timing trace.
+
+With `--with-apu`, the same probe executes both CPUs through the IPL transfer,
+later DMA, and decompression work. It reaches an unsupported `$4211` TIMEUP
+read after 1,359,156 65816 instructions. The accompanying deterministic ARAM
+hash is `49dd67b90ddb9ba3b7c75c3fcd02bf1bcebaf3ecabfa4392cb84a4e68b17784f`.
+This value is a local regression checkpoint until compared with an accurate
+emulator dump.
+
+With `--with-timing`, the runner passes `$4211`, reaches `WAI`, delivers
+repeated VBlank NMI, and performs general DMA, HDMA, controller polling,
+Mode-7 multiplication, CPU math, and WRAM-port traffic. The current regression
+runs 20,000,000 instructions without an unsupported-hardware barrier, with
+5,619 general-DMA transfers and 4,005 HDMA line transfers. It prints SHA-256
+fingerprints for WRAM, SRAM, VRAM, CGRAM, OAM, and ARAM. Its reported
+frame/beam position remains tied to the provisional
+eight-master-cycles-per-access adapter and is not a hardware timing oracle.
+
+With `--with-render`, the same real-ROM execution also proves that the
+renderer can consume changing PPU state for thousands of frames without
+creating a new execution barrier. The 1,700,000-instruction private regression
+pins a Mode-7 frame, while the 2,000,000-instruction regression preserves the
+later modes-1/5 hash. After low-resolution normalization, the Mode-7 image is
+an exact RGB match to an official Snes9x 1.63 screenshot. VRAM, CGRAM, and OAM
+also match an adjacent private Snes9x state byte for byte. Beam-aligned display
+registers and provisional timing still need event-aligned comparison, and the
+executable is not a playable desktop build.
+
+## Verification strategy
+
+Each milestone should combine synthetic unit tests, CPU state conformance, and
+private real-ROM integration. Future differential checkpoints will compare:
+
+- CPU registers and mode flags;
+- WRAM and SRAM;
+- VRAM, CGRAM, and OAM hashes;
+- DMA/HDMA channel state;
+- APU communication and ARAM/DSP state;
+- rendered frame hashes; and
+- deterministic input playback.
+
+The user's ROM running in an accurate emulator remains the behavioral oracle;
+it is never distributed with the project.
+
+## Native snesrecomp execution path
+
+The production-direction experiment is built around the pinned `snesrecomp/`
+submodule. Its fetch URL uses the DKC2 integration fork while
+`mstan/snesrecomp` remains authoritative upstream; exact revisions and license
+status are recorded under `third_party/snesrecomp/`. Private ROM-derived C is
+generated into ignored storage, while the repository owns only configuration,
+the DKC2 adapter, and verification tools.
+Unavailable runtime entry states continue through the shared 65816 interpreter.
+The current configuration has 3,325 roots across 13 banks and emits 3,475
+exact CPU-mode variants AOT. Two deliberate original-game fault variants
+remain LLE. This does not remove the interpreter: it remains the authoritative
+safety tier and handles those explicit dormant edges into non-code bytes if
+the original game's buggy calls are ever reached.
+
+Whole-program analysis is available through matching Python and Rust
+implementations. Python remains the semantic oracle and automatic fallback.
+The Rust path supports HiROM, DKC2's indirect dispatch/return forms, recursive
+exit-set solving, declared boundaries, data-region execution, and the same
+analysis limits. The current native regeneration converges on 3,325 roots,
+3,475 exact AOT variants, two deliberate LLE variants, and 13 emitted banks.
+The earlier Python/Rust timing comparison remains in the implementation
+journal; it is not projected onto this changed graph without rerunning both
+backends.
+
+The final normal control-flow gap is DKC2's WRAM-clear restart sequence. The
+call at `$80:85E8` enters `clear_full_wram` at `$80:8E7F`; that routine removes
+its own JSR return, saves a continuation, resets the hardware stack while
+clearing WRAM, and ends with `JMP ($0032)` at `$80:8EB8`. Configuration records
+the call as terminal and the indirect jump as a `ptrtail_popcall` dispatch to
+the proven continuation at `$80:85EB`, so the routine and its continuation are
+both compiled without pretending it executes an RTS.
+
+The other two gaps are bugs, not dynamic game dispatch. Calls at `$B3:BC20`
+and `$BA:9C36` enter `$B3:F289` and `$BA:F305` respectively, where the source
+layout documents data/garbage rather than callable code. `noreturn_jsr` ends
+lexical analysis after each real JSR while preserving the pushed guest frame;
+the emitted exceptional edge enters authoritative LLE at the exact target.
+Consequently the compiled callers are valid without fabricating return modes
+or compiling data as code.
+
+### Runtime-selected interior entry and non-local return boundary
+
+Structural whole-program coverage includes every entry demanded by the graph,
+but a game can place an interior address into mutable state and later call it
+through a runtime dispatcher. Swanky's gameplay dispatcher at `$B4:9EDC` reads
+such a state pointer from `$079C`. The owner-recorded Version 11 run reached
+`$B4:A3E0`, `$B4:A475`, and `$B4:A4CB` through that path even though those
+interior states were not separate roots in the prior generated dispatch table.
+
+The DKC2 configuration now divides the game-show routine at `$B4:A3E0`,
+`$B4:A475`, `$B4:A4CB`, `$B4:A5D9`, and `$B4:A665`, and divides the prize
+helper at `$B4:A7CA`. These are explicit AOT entry roots rather than inferred
+fall-through-only labels. The interpreter remains the safety tier for a future
+runtime-selected address that has no exact compiled variant. Regeneration
+verified exact M0X0 dispatch rows for all six entries in `dispatch_v2.c`.
+Diagnostics canonicalize the CPU-visible `$B4:*` ROM mirror to `$34:*`; the
+two spellings identify the same cartridge bytes, so validators accept either.
+
+A paired runtime call is also a real guest stack operation. The bridge pushes
+the two-byte JSR return frame before entering either AOT code or the
+interpreter. A compiled target receives `host_return_valid=2`, and both paths
+return their `RecompReturn` to the generated caller. State `$B4:A4CB` relies on
+an intentional non-local return: with M=0, `PLA` removes the two-byte JSR
+frame, then `RTL` removes the surrounding three-byte JSL frame. The
+interpreter bridge therefore returns `NORMAL` only when a clean call ends with
+S equal to the balanced post-call value. A different S is resolved through
+`cpu_resolve_post_return_skip`, clamped to at least `SKIP_1`, and propagated.
+Step-cap bailout still restores the balanced post-call S and returns `NORMAL`.
+Treating every clean runtime call as `NORMAL` would resume a compiled caller
+that the guest already returned past.
+
+DKC2's NMI dispatcher is non-returning: it jumps through direct-page `$20`,
+resets the stack, and reaches a new `WAI`. The game adapter therefore treats
+that wait as the next continuation instead of requiring `RTI`. A shared
+interpreter correction also makes `BRA` and `BRL` consume their operands before
+adding the signed displacement, avoiding compiler-dependent PC bases.
+
+The native headless host currently supplies neutral input and a 256x224 BGRX
+surface. Each host frame has a `1364 * 262` master-clock budget; long LLE work
+yields at that deadline and resumes at the saved 24-bit PC. Audio consumption
+uses a fractional `32040 / 60.098811862` accumulator, requesting 533 or 534
+native-rate stereo frames without long-term drift. The host reports aggregate
+blank-video and silent-audio runs, clipping, maximum same-channel sample jump,
+state/audio fingerprints, and can export private PPM/PCM evidence.
+
+For deterministic gameplay routes, the desktop host can record the complete
+packed 24-bit two-controller input word once per emulated frame and the
+headless host can replay the same stream. The source tree owns only the parser,
+telemetry, and assertions; recordings stay in ignored private storage. Route
+acceptance rejects interpreter-cap and unresolved-dispatch diagnostics so a
+completed frame count cannot conceal skipped game-code side effects.
+
+Current generated targets define
+`SNESRECOMP_EXTERNAL_RAM_ROUTINE_GUARDS`. This makes the generated
+`dispatch_v2.c` table the sole strong owner on MSVC while preserving
+SNESrecomp's fallback table for standalone and older generated clients.
+
+Static MVN/MVP follows the same scheduling contract. A block move always
+transfers at least one byte, updates DB and A/X/Y after every byte, wraps X/Y in
+8-bit index mode, charges seven CPU cycles per repeated byte at the mapped bus
+speed, and may yield only between bytes when an owning LLE scheduler reaches
+its frame deadline. Resumption re-enters the architectural opcode with the
+updated count and indices; the host never observes a partially applied byte.
+
+The frame adapter runs the shared PPU's VBlank handler after the visible-line
+pass; this reloads the internal OAM data-port address before the following
+NMI's complete 544-byte OAM DMA. A 12,000-frame gate proves two ordered attract
+cycles and a one-cycle PCM comparison passes against Snes9x's silence envelope,
+level, peak, and discontinuity metrics. Native semantic transitions still
+differ slightly from the reference: after preserving the full 65816 program
+bank and therefore FastROM timing, the first-cycle completion is six frames
+early instead of 54 frames late.
+
+The Windows desktop target is a thin project-owned presentation layer over the
+same core. Its default OpenGL backend uploads one completed BGRX8888 frame to a
+texture, draws it into the shared centered 4:3 viewport, and swaps a
+double-buffered window. A visible Win32 OpenGL context dynamically requests
+`wglSwapIntervalEXT(1)` and records whether the driver accepted it. Hidden
+automation deliberately requests no interval so a driver-controlled swap wait
+cannot stall a noninteractive process. If OpenGL initialization fails—or the user selects the
+compatibility backend—the GDI path composes the same frame and black borders
+into an off-screen DIB, then exposes the completed client image with one
+`BitBlt`. Both paths avoid the former visible clear-then-draw intermediate
+surface. It uses waveOut for
+fixed 2,048-frame signed-16 stereo blocks, asynchronous keyboard polling, and
+per-frame polling of up to two XInput devices. Launcher source choices route
+keyboard or connected gamepads to two 12-bit controller words packed into the
+shared runtime's existing `RtlRunFrame` input. Audio samples still come from
+the exact fractional accumulator; the fixed device blocks are only a queueing
+boundary. The first
+three blocks are prebuffered to absorb normal scheduler jitter, after which a
+high-resolution performance counter paces frames at 60.098811862 Hz. Runtime,
+rendering, and audio stay on one thread, avoiding unsynchronized access to the
+shared SNES state. The target uses the Windows GUI subsystem: an explicit ROM
+argument supports scripts and tests, while a no-argument launch opens the
+standard file picker and never creates a console window. Both routes enter the
+same exact-ROM verification and runtime function. Exact cycle alignment and
+perceptual sign-off remain open.
+
+The parallel `dkc2_snesrecomp_sdl` target is the portable gameplay host. It
+uses SDL2 for the native window and OpenGL context, texture presentation, keyboard,
+two hot-pluggable GameController devices, monotonic timing, and queued audio.
+It consumes the same generated C, runtime, frame adapter, verified-ROM loader,
+screen-color adapter, input router, FPS counter, rewind ring, and shared
+recomp-ui launcher as the Win32 host. The 4:3 viewport calculation and launcher
+settings/ROM-cache persistence are project-owned host-neutral modules rather
+than duplicated platform behavior. The portable presenter requests an OpenGL
+2.1 compatibility context so the game and recomp-ui overlay share one
+deterministic swap boundary. Its visible context requests SDL swap interval
+one on Windows and reports the accepted state through the same diagnostic
+backend field; hidden automation disables the interval. Visible macOS instead
+uses interval zero and paces on the display itself. The window's display link
+(`runner/macos_display_link.m`, macOS 14) delivers the display's refresh
+ticks on its own thread, asking the panel for 60 Hz so a ProMotion display
+ticks at 60 rather than 120; `runner/desktop_pacer.c` measures the tick
+interval and locks when one, two, three, or four ticks per frame keep the
+frame rate within 2% of the cartridge's 60.098811862 Hz, so a 60-Hz display
+shows every frame once and a 120-Hz display twice. Once locked, each frame
+waits for the tick that is `ticks_per_frame` after the one the previous
+frame followed and presents right after it, which lands every frame on the
+same phase of the refresh about 13 ms ahead of it. A frame that misses its
+tick presents on the next one without catching up, ticks that stop for 50 ms
+release the lock, and a display whose rate cannot be locked (50, 75, 90, or
+144 Hz) or a system without display links falls back to the earlier host
+clock: one absolute Mach deadline at 60.098811862 Hz, a short final spin,
+presentation after the wait, and re-anchoring after a miss of more than 2 ms.
+`DKC2_DISPLAY_LOCK=0` keeps that clock deliberately.
+
+Locking the frame cadence to the display makes the game run at the
+display's rate, 0.16% slow on a 60-Hz panel, so the audio is kept in step
+by dynamic rate control (`runner/desktop_audio_rate.c`) rather than by the
+frame clock: every frame's samples pass through a linear resampler whose
+ratio, within half a percent of unity, follows an exponential average of the
+queue fill against a target of half a device pull plus two frames. The same
+control runs under the host clock, where it also absorbs the audio device's
+clock drifting from the host's. The queue is primed unpaced to the target
+after start, a state load, or a speed change, and only a queue that has
+drained below one frame after a host stall runs unpaced again. Swap policy
+affects only host presentation; emulation state remains owned by the same
+single-threaded host loop. `DKC2_PACING_LOG=<file>` records one line per
+presented frame, with the display tick it followed and the time in each
+loop stage, and `scripts/analyze_pacing_log.py` estimates from it how many
+refreshes each frame was shown for.
+
+The in-game overlay is a second, gameplay-lifetime recomp-ui/ImGui context;
+the pre-boot launcher still owns and destroys its separate window/context.
+The host-neutral C model owns open/closed state, the Assist Tools gate, a
+wrapped 0–4 slot selector, one-shot Resume/Quit/Save/Load actions, and the
+validated lifecycle of one active keyboard/controller binding capture.
+Platform glue supplies SDL events or a small Win32 input translation, and the
+presenter submits ImGui draw data after the game quad but before the same
+buffer swap. While open, the hosts schedule no SNES frame, zero game input,
+clear/pause queued audio, and continue presenting at the host rate. File-state
+actions reuse SNESrecomp's `RtlSaveSlotPath`,
+`RtlSaveSnapshot`/`RtlLoadSnapshot`, and `save_name_prefix`; the bounded
+selector maps to `saves/dkc2s0.sav` through `saves/dkc2s4.sav`, and only slot
+zero probes the old `saves/dkc20.sav` compatibility name. The GDI fallback has
+no ImGui renderer, but its keyboard Assist shortcuts follow the pre-boot
+opt-in state.
+
+`RecompLauncherCSettings` is the one persisted settings value shared by the
+pre-boot launcher, overlay, Win32 host, and SDL host. The overlay edits every
+DKC2 setting shown before boot and exposes independent Player 1/2 input
+source, deadzone, and complete gameplay/Assist binding controls. Volume,
+texture filtering, screen model,
+controller routing, and Assist policy are safe to apply live. Window scale,
+fullscreen, renderer, audio enable, and skip-launcher remain restart-bound
+because they affect native resources or startup flow. The shared audio
+frequency field is mirrored and persisted for launcher compatibility, but the
+current DKC2 hosts deliberately consume the S-DSP's native 32,040 Hz stream
+without a host resampler. Both hosts copy the final overlay value back to
+`launcher.cfg` on exit.
+
+The generic recomp-ui ABI has additive optional `has_assist_tools`,
+`assist_tools_note`, and `credits_text` game fields plus the persisted
+`assist_tools` setting. Games that do not set them retain the former
+Dashboard/Settings/Controller surface; DKC2 receives two additional top-level
+pre-boot pages without game-specific code in the shared renderer.
+The project pins these additive changes from
+`Nicktendonick/recomp-ui@0b1ac7f` while the corresponding upstream review is
+pending; `mstan/recomp-ui` remains the authoritative source.
+
+The launcher receives a host-owned, complete default-settings snapshot through
+the additive recomp-ui game ABI. Recomp-ui copies it into the view model during
+initialization and exposes a confirmed Restore Defaults action only when that
+snapshot exists. Confirmation replaces the settings working copy atomically;
+ROM selection and save files are separate state and therefore remain intact.
+Both playable hosts use the same `Dkc2LauncherSettingsDefault` function for
+startup and reset, preventing the UI defaults from drifting from first-run
+behavior.
+
+The same settings value now owns input bindings. Additive
+`player_key_bind`, `player_pad_bind`, `assist_key_bind`, and
+`assist_pad_bind` arrays are enabled only when a host advertises
+`settings_bindings`. Keyboard entries are SDL scancodes; controller entries
+encode SDL's standard controller button or signed axis vocabulary. The
+launcher capture state writes those arrays directly, so it never presents a
+binding file that DKC2 ignores. The SDL host evaluates scancodes natively; the
+Win32 host translates the same scancodes to focused-window virtual-key state.
+Both hosts evaluate the same standard-controller encoding and route the
+resulting 12 logical SNES buttons into the existing packed input word. The
+overlay writes those same arrays, with SDL event capture for keyboard input
+and a host-neutral first-controller snapshot for buttons and signed axes.
+Controller capture must observe a neutral state before accepting input, so
+the navigation button used to enter capture cannot self-bind. The model
+cancels capture when the overlay closes. Assist bindings are global, but
+policy still masks every Assist action when the gate is off. Escape,
+Guide/Start+Back, and the F performance-log key remain fixed recovery and
+diagnostic shortcuts.
+
+The two hosts coexist deliberately. Windows remains the accepted public release
+and regression baseline. The SDL target now produces an Apple-silicon
+`DKC2Recomp.app` with AppKit menus, an icon, bundled SDL2, and mutable state
+under `~/Library/Application Support/Flat2VR/DKC2Recomp`. The local bundle is
+ad-hoc signed and tested, not Developer-ID signed or notarized. Linux remains a
+source target pending native acceptance. The source does not infer success for
+hardware or operating systems that were not available to test.
+
+The Mac menu command queue is distinct from configurable Assist bindings.
+Fixed Quick Save/Load menu commands are admitted directly to the Slot 1 state
+path even when Assist Tools are off; rewind, fast-forward, overlay state
+controls, and user-remapped shortcuts retain the opt-in gate. This distinction
+does not enter controller registers or serialized SNES state.
+
+Screen-color modelling is a separate present-time stage before any backend.
+Raw returns the core-owned pixel pointer without conversion. CRT, Composite,
+and Trinitron first quantize the rendered BGRX channels to the SNES five-bit
+channel domain, then consult the 32,768-entry color LUT in SNESRecomp's shared
+`runner/src/snes/color_lut.{c,h}` module. That module was aligned with the exact
+PSXRecomp revision documented under `third_party/psxrecomp_color_lut/`; it
+models phosphor primaries, display gamma, luminance, and black floor, not
+scanlines or curvature. The transformed pixels live in a host-only
+scratch frame. They never write PPU state, emulated memory, save states, raw
+frame export, or deterministic reference hashes. Nearest/bilinear sampling is
+applied later by OpenGL and is independent of the screen model. The GDI path
+uses its established scaling behavior while still receiving the same
+color-model output.
+
+The desktop host's time controls use shared-runtime in-memory snapshots. A
+generic memory-backed `SaveLoadInfo` adapter serializes the same SNES state as
+the existing file-state path. DKC2 appends its external CPU continuation,
+frame deadline, APU pacing counters, MEMSEL, HDMA enable, and frame counter;
+load hooks repair host pointers and clock anchors. The host captures before
+the PPU draw pass because drawing advances HDMA/VBlank state, then performs
+one draw immediately after restore to recreate the original post-draw
+boundary. A bounded LIFO ring retains 300 snapshots at three-frame intervals.
+
+Battery SRAM is a separate persistence boundary. After exact-ROM loading the
+process anchors relative paths to the executable directory, creates `saves`,
+and reads the runtime's 2 KiB cartridge RAM. A clean exit rotates
+`save.srm` to `save.srm.bak` and writes the live cartridge RAM. Integration
+tests disable this path so deterministic automation cannot mutate user data.
+
+Host observability remains outside the emulated machine. A small presentation
+counter updates the Windows title once per wall-clock second. Optional
+telemetry measures input, emulation, snapshot work, PPU drawing, audio,
+presentation, and pacing with `QueryPerformanceCounter`, then writes aggregate
+samples to `performance.log`. It does not alter SNES clocks, controller bits,
+memory, snapshots, or generated code. Telemetry records which of OpenGL or GDI
+is active and measures CPU-side presentation duration. GPU timestamp queries
+are not implemented, so GPU time remains explicitly unavailable on both paths.
+
+Windows icon packaging is also host-only. `DKC2_DESKTOP_ICON` configures an
+optional `.ico` resource into the executable and window class while keeping
+the image external to the source repository. Release speed flags apply only
+at compilation (`-O3` for GCC/Clang and `/O2` for MSVC); they do not change the
+runtime scheduler's target rate.
+
+## Host diagnostics boundary
+
+`runner/diagnostics.c` composes DKC2-specific run state with SNESRecomp's
+shared host-report layer. Both playable hosts initialize it only after paths
+are anchored beside the executable, update a frame/resume-PC heartbeat, record
+the selected presenter/filter/audio state, and close it before host teardown.
+Controlled runtime failures write immediately; `Die()` reaches the same path
+through an `atexit` handler. Windows registers an unhandled-exception filter
+and delegates minidump creation to the framework. POSIX signal handlers do
+only async-signal-safe marker I/O, and the next launch completes the bundle.
+
+The DKC2 report now includes the shared runtime's rolling indirect-dispatch
+ring: the most recent 1,024 events retain source, target, CPU M/X mode, AOT
+hit/miss, mirror resolution, and guest frame. This is host observation only.
+`scripts/validate_swanky_run.py` combines that report with tier-2 coverage and
+optional performance telemetry. A valid focused run must contain a native
+M0X0 `$B4:9EDC -> $B4:A4CB` call and no interpreter cap, Swanky tier-down,
+known corrupt edge, or SNES MMIO code address. Canonical `$34:*` report
+addresses and CPU-visible `$B4:*` mirrors compare as the same ROM location.
+
+The external private diagnostic packager carries the verified ROM, saves,
+launcher settings, control bindings, paired recordings, normal/trace hosts,
+and focused validator into a numbered folder outside Git. Its recorder treats
+recording-specific files as append-only and deletes only the two rolling host
+outputs before launch. A successful session must replace those rolling files
+with fresh performance and last-run evidence before they are copied under the
+recording's unique basename.
+
+The rolling report and timestamped bundle are host artifacts, never emulated
+state. Bundle construction copies from a fixed allowlist rather than scanning
+the working directory. It cannot include the ROM cache, ROM, generated C,
+SRAM, file states, frame captures, or audio captures. Module paths and machine
+information are intentionally present for debugging and are disclosed in the
+bundle README.
+
+Save paths have not yet been redesigned for mods. Five Assist slots write
+`saves/dkc2s0.sav` through `saves/dkc2s4.sav`; the first retains load-only
+compatibility with `dkc20.sav`. Official SNESrecomp now has an opt-in
+versioned package/plugin runtime, but DKC2 has not adopted or validated it.
+Mod-aware isolation must be designed against that stable identity rather than
+inventing folder names before the mod integration lands.
+
+## Public and personal package boundary
+
+Repository-local `versions/Version NN` folders are source-derived public-safe
+handoffs and intentionally omit ROMs, saves, configuration, diagnostics, and
+generated game code. `scripts/create_personal_test_version.ps1` may transform
+one completed handoff into a ready-to-run personal copy only in an external
+directory. It verifies the supported ROM hash, uses a relative `rom.cfg`, and
+optionally transfers the user's saves and launcher settings. This is a
+deployment convenience only; it does not alter emulation, save formats, or
+the repository's content boundary.
+
+## Experimental widescreen boundary
+
+Widescreen is a host-owned, opt-in presentation and game-boundary adaptation.
+`runner/dkc2_video.{c,h}` owns the geometry: authentic mode remains 256x224;
+16:10 allocates 26 additional source columns per side for a 308x224 PPU
+surface; and 16:9 allocates 43 per side for 342x224. With the SNES 7:6 pixel
+aspect ratio, those surfaces present at approximately their named display
+aspects without scaling the authentic center.
+
+The game adapter chooses a layer policy every frame. In audited Mode 1
+gameplay, enabled 64-column BG1/BG2 layers use DKC2's full WRAM camera X and
+the live 10-bit PPU vertical source phase. SNESrecomp's shadow tilemap captures
+the authentic center and the game's subsequent VRAM uploads in that same
+coordinate domain; margin lookup therefore does not confuse a recycled
+64-column VRAM page with a different part of the level.
+
+The shadow's vertical key space contains 1,024 8-pixel rows. This is larger
+than one 10-bit PPU scroll period by design: the adapter first unwraps the
+rendered PPU phase into the level-relative vertical epoch, and a tall room can
+therefore address rows 512-1023 even though the hardware tilemap itself is
+recycled. Topsail Trouble's lower camera boundary produces exact source rows
+512-540. A 512-row store rejected those prefills and made both host-created
+BG1 margins transparent; increasing only the host shadow capacity preserves
+the resolved coordinate domain without changing cartridge WRAM, VRAM, camera,
+streaming, or collision state.
+
+BG1 does not depend on history for unseen leading terrain. The adapter reads
+the current decompressed 32x32-metatile map and 8x8 definition table from the
+WRAM bank selected by `$9A`, reproduces the cartridge's vertical column-buffer
+rotation, and prefills exact shadow entries. Shadow keys derive from the
+10-bit PPU phase actually rendered. Horizontal decompressed-map rows instead
+select the PPU's low-eight-bit phase nearest camera Y minus `$0100`, matching
+the cartridge column builder's staged source page. This distinction matters
+when camera Y crosses a 256-pixel boundary: the physical rolling tilemap page
+can change while the semantic level-map row remains on the preceding source
+page. WRAM camera Y can also contain the following frame's value at the NMI
+boundary, so rendered fine phase remains authoritative within the selected
+page. A shadow key at
+camera/object X maps to source X minus `$0100`, matching the
+source/destination relationship in
+`$B5:ACA8-$B5:ACB7` and `$B5:ADF0-$B5:AE01`. `$0AFC` supplies the horizontal
+camera bound; the one staged 32-pixel guard metatile is retained, while later
+columns are filled with a character proven transparent from live VRAM. The
+vertical decoder's terminal-edge rule below masks that guard only outside the
+authentic viewport; other accepted layouts retain it. Unknown
+cells use that verified-transparent entry rather than falling through to stale
+VRAM. Pirate Panic's 32-column BG2 parallax map is intentionally cyclic, so its
+already-rendered native scanline repeats into the margins. Bounded 32-column
+BG3 remains centered or uses only an explicitly proven rendered-scanline
+repeat. An enabled physical 64-column BG3 may join the final render mask only
+after the exact BG1/BG2 terrain owner has passed the same readiness gate; a
+wide `BG3SC` register by itself never opts a title, menu, or staging screen in.
+
+### Ship-deck rigging decode
+
+The Gangplank Galleon deck levels draw their foreground rigging on that
+physical 64-column BG3, and the cartridge streams it with no lead at all:
+`$B5:AA88` uploads the one 8-pixel column entering the native view the frame
+it arrives, and `$B5:AC25` rewrites a row's 64 ring words from a buffer of
+which only the 33 native columns were rebuilt. Every ring column outside the
+native window therefore holds either the column from 512 pixels away or a
+previous row's leftovers, and a margin read from the ring showed a second
+rope strand cutting the real one off at a false apex. The rigging map is
+static ROM data (bank `$F5`, map at `$26A7`, 40 column-major columns of
+sixteen entries wrapping at 1280 by 512 pixels, 32-byte metatile definitions
+at `$2087` whose bits 14-15 mirror the definition and toggle the tile's own
+flip bits), so the host decodes it (`Dkc2VideoDecodeRiggingTile`) into a
+third world-keyed shadow layer (`kDkc2RiggingLayer`), keyed by the rendered
+PPU phase like the terrain owner (horizontally through the 10-bit scroll,
+vertically through the layer's 8-bit scroll rebuilt in 256-pixel epochs
+from the camera) and served through the same 2bpp renderer hook the 4bpp
+layers already had. The decode is trusted only after it
+reproduces all 32 fully uploaded native columns over the 28 fully visible
+rows for the current frame (through the row upload's own high-byte shift,
+`Dkc2VideoRiggingCellMatches`, described in HARDWARE_NOTES.md), and the
+streamer is recognized by its own latches (`$C6` for the last column origin, `$17CE` for the last row
+origin, each within one cell of the rendered phase); a recognized rigging
+layer whose decode fails shows no margin at all rather than the ring. The trace reports
+this as `rigging` with the native verification counts.
+
+### Level-name cards
+
+A level-name card runs the cartridge's NMI sub-mode 11 inside the
+gameplay mode: a static picture on bounded maps with no camera and no
+terrain stream, which the layout path cannot extend. The host presents a
+card like every bounded screen, centered between black margins, and
+never through the terrain path (a card whose picture sits on a
+64-column map used to reach the unproven-terrain black fill instead,
+with the same look). The 64-column cards hold a wider painting on the
+right, but at scroll zero their left margin could only be the map's
+wrap, and the 32-column cards have nothing beyond their 256 columns at
+all; a mirrored presentation was tried and the owner preferred black.
+
+### World store depth
+
+The world-keyed store holds 4,096 tile columns by 2,048 tile rows
+(32,768 by 16,384 pixels). It held 1,024 rows until Parrot Chute Panic:
+that shaft is 13,040 pixels tall and its unwrapped keys pass row 1,700
+near the bottom, where the smaller store silently rejected every capture
+and prefill (`InBounds`), every margin lookup missed, and the terrain
+margins showed the blank tile with the backdrop layers behind it. The
+trace exposed it as `terrain_source.prefill` with zero present cells and
+a `shadow` row of nothing but misses and blanks.
+
+### Object planes
+
+Haunted Hall draws Kackle as a 32-column by 13-row block into the left
+page of a 64-column BG2 map (`$6800`) and moves him with the layer's
+scroll; the right page is blank. The band is not at the terrain phase and
+the map is rewritten as he animates, so it was a repeat band: the native
+line repeated into the margins cut his off-screen part at the 4:3 edge and
+copied his visible part into the far margin. A 64-column map with exactly
+one populated page (`Dkc2VideoTilemapIsObjectPlane`) is now a plane band
+without the static gate: read raw, the map's wrap shows his off-screen
+part beside the view and nothing in the far margin, which is what a wider
+console would draw.
+
+### Object windows under the presentation bias
+
+The cartridge keeps three camera-relative windows for objects: the sprite
+renderer's cull (`$B5:9F40`, [-$30, $130)), the placement activation
+radius (`$BB:BB07`, per-class pairs such as [-$20, $120)), and the live
+sprite list's release window (`$B5:9C52`, [-$30, $130) horizontally and
+[-$10, $120) vertically, built as x - camera - $80 + $B0 < $160). The
+generated code adaptations (`scripts/apply_dkc2_widescreen_overrides.py`)
+route each window's left slack and span through `Dkc2VideoExpandCullLeft`
+and `Dkc2VideoExpandCullSpan`. Those helpers add one margin per side once
+terrain is proven, and now also account for the presentation bias the
+host rendered last (`Dkc2VideoSetPresentationBias`): the presented window
+is the camera shifted by the bias, so the left slack is `extra - bias`
+and the right slack `extra + bias`. Before this, the release window was
+unadapted and the radius ignored the bias, so a barrel cannon standing in
+the right margin next to a level's left wall (bias +26 at 16:10) was
+released 314 pixels past the camera while the presented window reached
+334, and it vanished on a small step left.
+
+### Level-map row stride calibration
+
+The decoded level map is column-major for horizontal stages and
+row-major for the rest, with a bytes-per-metatile-row stride the scroll
+handler bakes in: 64 for the vertical shafts, 192 for the square
+scroller's audited stage (`$B5:B555` multiplies the row by six), 32 for
+Parrot Chute Panic, 160 for the ship holds. A stage can run a different
+column builder than its sub-mode suggests: Bramble Blast (`$002D`,
+sub-mode `$10`) stores 80 metatiles per row like a ship hold, and
+decoded with 192-byte rows every margin cell came from another row of
+the map, which showed as blocks of unrelated tiles beside the view. The
+prefill now verifies the stride in use against the fully staged native
+window (32 columns by 28 rows of the ring, compared on the character
+index) every frame; below 90 percent it tries every candidate stride
+(32 to 256 bytes in 32-byte steps) and adopts the best one above the
+gate for the rest of the stage (`Dkc2CalibrateRowStride`,
+`Dkc2VideoDecodeLevelTileRowMajor`). With no candidate above the gate the
+terrain stays unproven and the margins are black. The trace reports the
+stride and its match as `terrain_source.stride`.
+
+### The terrain phase
+
+Every world key, the prefill's source rows, and the band classification
+take the terrain layer's rendered scroll phase from the frame-start
+BGnHOFS/BGnVOFS pair, which is the camera phase, trailing it by at most
+a few pixels, in every stage audited before Slime Climb. Slime Climb
+leaves BG1VOFS at $50 at frame start and lets its HDMA write the camera
+row (with about two hundred bands for its water) on every rendered line,
+so nothing displays the frame-start value: keyed from it, the store held
+the wrong rows, every band was classified as a repeat, and the margins
+showed pillars and rafts repeated from the native line. The host now
+selects the phase per frame (`Dkc2VideoSelectTerrainPhase`): the
+frame-start pair stands when it lies within the terrain lead of the WRAM
+camera phase; otherwise the band pair within that lead covering the most
+rendered lines replaces it. The trace reports it as
+`terrain_source.phase`.
+
+When neither the frame-start register nor any band is at the camera
+phase, the phase follows the scroll that covers at least half the
+frame's lines, provided it lies within `kDkc2VideoTerrainPhaseFollow`
+(32 pixels) of the camera. Toxic Tower on Rattly is the case: the
+bounces move the camera five pixels a frame and BG1's scroll follows
+through the HDMA table from line 1, so the register is a frame behind
+and beyond the four-pixel lead, and every band is five pixels beyond the
+register. Keyed on the register, every band read as off-phase and the
+whole layer fell to the repeat policy for that frame, repeating the
+ring's edge columns into the margins as a one-frame flash. A parallax
+layer's scroll sits hundreds of pixels from the camera and never
+qualifies.
+
+### Static plane bands
+
+A wide BG1/BG2 band that is not at the terrain phase used to repeat its
+rendered native scanline into the margins at the period its interior
+proves, or at 256 pixels when it proves none. That is right for a bounded
+map and for the ship hold's 96-pixel cabin wall (a 64-column map whose
+pattern does not divide 512 pixels, so the cartridge re-bases its scroll
+to keep the wrap seam off screen), but it cut Red-Hot Ride's foreground
+rocks at the 4:3 edges: the rocks and the far lava spikes share one static
+64x64 map (`$6400`) that HDMA swaps between BG1 (the rocks, at twice the
+camera speed, below the lava line) and BG2 (the spikes, at half speed,
+above it), and a 512-pixel plane repeated at 256 shows the wrong half of
+itself beside the view. The HDMA scan now records each band's BGnSC, and a
+band whose map is 64 columns wide, is not the terrain stream's destination
+(`$17B6`), has had no VRAM write since the camera last traveled 24 pixels
+(the engine stamps every VRAM page with the frame of its last write;
+a level starts with its pages counted as traveled, and the audited
+non-terrain maps are uploaded once at load), and whose content is authored
+to continue across its own wrap (`Dkc2VideoTilemapWrapsAuthored`: no
+populated row with a shortest period that fails to divide 64 columns, no
+blank strip of four or more columns at either map edge) is a plane band
+(`kDkc2BandPolicyPlane`). The engine presents it through a raw band
+(`PpuSetWidescreenLayerRawBand`): the layer's own map continues into the
+margins as the hardware wrap, the world-keyed shadow is bypassed like a
+repeat band, and no padding merge replaces the rendered margins. The trace
+reports the plane band count per layer as `planes`.
+
+Two refinements from Toxic Tower. A cell counts as painted only when its
+entry is non-zero and names a character with non-zero pixels
+(`Dkc2VideoCharacterIsTransparent` at the layer's character base): the
+tower's top-of-screen wall map fills the cells beyond its slanted edge
+with `$8000`, a flip flag over character 0, which a non-zero test took
+for painting, so the map passed as wrapping authored and the margins
+showed the backdrop through the wall in patches that moved with the
+per-line scroll. And a band is presented as a plane only when none of
+the rows it shows, from its own vertical scroll and scanlines, is a
+broken row (`Dkc2VideoTilemapBrokenRows`): a row painted in at least 48
+of its 64 cells whose painting stops four or more cells short of either
+wrap edge, a strip narrower than its map rather than scattered
+decoration. Such a band repeats the ring instead. The verdicts are
+cached per map with the character base they used.
+
+### Lava geyser steam decode
+
+The lava stages that run the cartridge's NMI sub-mode 18 (Red-Hot Ride)
+draw their steam columns on a bounded 32x32 BG3 that scrolls with the
+camera. The cartridge keeps the stage's geyser positions in ROM (a list at
+`$B3:D65B`, bit 0 marking a tall column, `$8000` ending the list, WRAM
+`$0959` holding the stage's first entry), registers the geysers near the
+view in four WRAM slots (`$095B..$0961`: map word offset, bit 15 tall,
+bit 14 being cleared), and draws each registered geyser as a three-column
+block of 2bpp map entries (`$80:CB71`, one column DMA per block column with
+`VMAIN=$81`) from the column-major animation tables the long-pointer table
+at `$80:D3AD` selects: four short frames (three by ten, map rows 14-23),
+four tall (three by eighteen, map rows 6-23), the frame being (frame
+counter `$2A` >> 2) & 3, the leftmost map column ((X - 8) >> 3) & 31. A
+256-pixel map wraps a geyser standing beside the view onto the opposite
+edge, so the repeat policy's hardware wrap put a steam column over solid
+rock in the margin, and the cartridge clears a slot as soon as its geyser
+leaves the native view, so the ring held nothing for a geyser standing in
+the margin. The host now decodes the geyser list and the animation tables
+(`Dkc2VideoGeyserEntry`) into the third world-keyed shadow layer
+(`kDkc2GeyserLayer`, shared with the rigging: world X from the rendered PPU
+phase, world Y the PPU scroll itself since the map is periodic in Y),
+forces every margin cell and a 24-pixel inset of each native edge (three
+block columns, where the cartridge's own wrap sliver lands) each frame,
+blank where no geyser stands, and trusts the decode only after it
+reproduces every geyser block the cartridge has fully drawn this frame (a
+registered but not yet drawn block, blank until the next four-frame
+animation tick, is skipped). A geyser stage whose decode fails keeps BG3
+out of both the widen mask and the repeat policy for that frame, so it
+shows no BG3 margin rather than the wrap. The trace reports this as
+`geysers`.
+
+What a host margin shows where the level authors nothing is a selectable
+edge policy (`Dkc2VideoEdgePolicy`, environment `DKC2_WIDESCREEN_EDGE`,
+launcher key `WidescreenEdge`). Every known layout authors terrain from
+world X=`$0100` through `maximumScrollX+256`, so the question arises within
+one margin of a hard level wall and in rooms narrower than two margins.
+
+- `reflect`: the presented view stays locked to the cartridge
+  camera, both margins remain visible, and the terrain decoder mirrors the
+  nearest authored columns across the boundary with the horizontal flip bit
+  toggled (`Dkc2VideoResolveEdgeTile`). Within one margin of a wall a
+  physical 64-column BG3 repeats its rendered line instead of reading ring
+  columns the level never authored.
+- `bars`: the presented view stays locked to the camera and each visible
+  margin is clamped to the authored extent through the shared PPU's per-side
+  margin, so the unauthored strip is black.
+- `shift`: the presented view is moved inward by a bias while the room can
+  absorb the margin, and centered with clamped margins when it cannot. The
+  renderer shifts BG scroll and OBJ placement together. This keeps every
+  margin inside the authored extent, but the view stands still for the
+  first margin's worth of camera motion away from a wall and then starts
+  scrolling at the camera's catch-up speed, and every sprite, HUD included,
+  slides with the bias. Measured on the hard-left lava state at 16:9: the
+  camera moves from 256 to 298 over frames 15-33 while the presented view
+  stays at 256, then scrolls from frame 34.
+- `glide` (default): the same pins as `shift`, so the margin never leaves the
+  authored extent, but the inward bias is released one pixel per eight
+  pixels of camera travel from each wall (`kDkc2VideoEdgeGlideSpan`)
+  instead of all within the first margin. The background scrolls at seven
+  eighths of the camera speed for the first eight margins away from a wall
+  (344 pixels at 16:9, 208 at 16:10) and the sprites drift over it at one
+  eighth of their speed, then everything is centered and locked. At the
+  wall itself `glide` and `shift` are pixel-identical.
+
+The policy is chosen in the pause menu's Settings page ("Level edge"),
+remembered in `launcher.cfg`, or overridden for one run with
+`DKC2_WIDESCREEN_EDGE`.
+
+A bias changes what the PPU's own 256 columns contain. With bias b the
+cartridge's authentic VRAM window sits at screen columns [-b, 256-b): the
+first b columns of the 4:3 image move into the left margin and the last b
+native columns are beyond anything the cartridge wrote for them (a rolling
+ring's stale or prefetched page). The host therefore tells the world-keyed
+shadow which end of the native window is not authentic
+(`WsShadowSetNativeViewportInset`), so the renderer's native fast path stops
+at the authentic window and those columns come from history and decoded
+terrain like any margin; the same bounds drive the per-pixel split inside a
+tile chunk that straddles the boundary. Repeat bands, which bypass the
+shadow, do the equivalent in the padded merge: only the authentic window is
+copied from the isolated render, a 32-column map's remaining native columns
+are kept because they are its exact hardware wrap, a 64-column ring's stale
+tail is continued from the authentic window, and the period detector and the
+stale-endpoint repair work on the intersection of the authentic window and
+the screen interior, so at bias 0 nothing changes.
+
+Objects follow the same rule: the renderer shifts every object by the bias,
+and the game's own culls (already widened by the margin) place objects for
+the presented right margin up to the bias beyond the authentic margin. The
+shared PPU's nine-bit object X decode counts an X as positive up to the
+current right margin plus a positive bias (`PpuDecodeOamX`); before that,
+a Zinger beside the rope net at the start of Topsail Trouble lost its right
+half at exactly the authentic margin.
+
+The prefill also distinguishes the cartridge window from the presented one.
+Every presented cell outside the cartridge window takes the decoded map
+over live history, the columns a bias slides into view included (a game
+write from the last frame still wins, as in every margin); the columns a
+bias moves into the margin are still inside that window and keep their
+captured ring content, so a bottom guard row the cartridge has not staged
+yet renders the same stale line the console shows instead of a decoded one.
+The slid-in columns once kept whatever history they had, and that history
+could be a misattributed capture: in a vertical stage the cartridge rewrites
+the ring's other page with the same stale 32 entries on every row upload,
+and the store attributes other-page writes by the last horizontal travel
+direction, which a one-pixel camera jitter flips. The crow's-nest art then
+sat on the mast at the right wall until the stage was left.
+
+### Reconstruct upscaler (experiment)
+
+The macOS presenter is a fixed-function OpenGL 2.1 blit with nearest or
+bilinear sampling. On a 16-inch MacBook Pro the 342x224 frame is shown at
+about ten times its size, a fractional scale at which nearest gives uneven
+pixel widths and bilinear blurs. Reconstruct (`desktop_present_sdl.c`) is
+a single GLSL 1.20 fragment pass over the same texture, resolved through
+SDL's GL entry points, that treats every output pixel analytically instead
+of resampling a fixed 2x or 3x grid:
+
+- Sharp boundaries: inside a texel the color is flat; within one output
+  pixel of a texel edge it blends with the neighbor (the sharp-bilinear
+  idea), so straight edges are crisp and moire-free at any scale.
+- Dither decoding: a 2x2 checkerboard between two colors, or a one-texel
+  vertical or horizontal line dither, is what the artists used for a
+  mid-tone a CRT would blur; the texel takes that average before anything
+  else looks at it. Only exact 3x3 patterns qualify, so genuine one-pixel
+  lines are untouched.
+- Diagonal edges: the xBR level-1 corner test on the 21-texel footprint
+  decides whether a texel corner belongs to a diagonal edge; that corner
+  takes the nearer neighbor's color along an antialiased 45-degree line,
+  and level 2 adds 2:1 and 1:2 lines where the test says the edge
+  continues. The pre-rendered DKC art keeps its shading and loses the
+  staircase.
+
+- Softening: the transition band of every reconstructed edge and pixel
+  boundary widens from one screen pixel to up to three, and where a
+  texel's neighbors are close in color (a shading band of the pre-rendered
+  art rather than an outline) the flat interior blends toward a bilinear
+  gradient, so terraced faces and dithered skies read as continuous
+  shading while outlines keep their contrast.
+
+Modes 0..4 enable the stages cumulatively (mode 4 adds 3:1 slopes) and the
+strength, softness, and smooth-shading sliders scale the edge blend, the
+band width, and the gradient blend, so each can be judged on its own; the
+default is level-2 slopes with softness 50 and shading 60, which the
+owner's play test preferred over the hard first cut. The shader runs after
+the screen-model lookup table, so CRT, Composite, and Trinitron still
+apply. When the shader cannot be built the presenter reports why and falls
+back to the sampler implied by the texture filter. `DKC2_DESKTOP_SCREENSHOT`
+reads the drawable back from a hidden run, and `DKC2_DESKTOP_TEST_LOADSTATE`
+starts that run from a preserved state, which is how the experiment is
+captured for comparison without a visible window. The state path must be
+absolute, since the Mac app changes into its user directory at start.
+`DKC2_PACING_LOG` and `DKC2_DISPLAY_LOCK` are the visible host's pacing
+switches, described with the presenter above.
+
+### Dispatch tables with null slots
+
+The recompiler resolves a `JSR (abs,X)` into a static switch over the
+table it reads from the ROM, stopping at the first null slot because a
+real handler never sits at `$0000`. DKC2's sprite sub-state dispatcher at
+`$B3:CB3D` breaks that assumption: its 16-slot table holds the six
+handlers, two null slots, the six again for objects whose script has set
+sub-state bit 3 (touch damage), and two more nulls. Auto-read to six,
+every object with bit 3 set took the out-of-bounds arm and its behaviour
+script stopped stepping, which is why Screech's Sprint's Kloak hung idle
+instead of throwing. The site is declared in `recomp/bankb3.cfg` with
+fourteen entries, and the decoder treats a null slot inside a declared
+table as a null entry (codegen emits its unpop-and-fall-through arm), as
+the explicit target form always did. No other DKC2 dispatch site has a
+null slot followed by handlers.
+
+### The map-derived west hold
+
+The glide slides the frame inward at the level's walls and releases the
+slide with travel away from them, but it only knows the walls the WRAM
+gives it: the map's first page (`$0100`) on the west and `$0AFC` on the
+east. A level can hold the player at the authored world's edge with no
+camera bound there and nothing in the map beyond: Screech's Sprint
+starts on a plank platform at world 608, the camera cannot go west of it,
+and the map is empty for ten columns west. The glide saw a camera well
+inside the level, kept both margins, and the platform ended at the
+native edge with the bramble backdrop beside it. The prefill now reports
+a west hold when the columns the unbiased margin would reach beside the
+cartridge window are empty for the whole visible height
+(`Dkc2VideoHoldWest`) and the player is pinned there: within forty pixels
+of the frame's west edge (the camera leads a walking player by about
+sixty, so twenty is a player the camera failed to centre) with the camera
+unmoved since the last frame, or the level has just started, since a
+level opens with its camera at a bound and a fresh Screech's Sprint
+spawns Diddy sixty pixels in where the pin would wait for him to walk
+into the edge (the first eight prefill frames after a level change; a
+state restore is not a level start). Emptiness alone is not a hold:
+Toxic Tower's interior is empty on BG1 beside a freely scrolling camera.
+Once entered the hold persists while the void stays beside the window,
+whatever the camera does. The window's first column at entry becomes the
+west bound
+(`Dkc2VideoPresentationMarginsBounded`), the frame slides so nothing west
+of it shows, and the slide releases with travel as at any wall. The
+presented bias moves at most one pixel per frame toward the glide's
+target (`Dkc2VideoMarginsForBias` derives the margins from the bias the
+host chose), so a hold that appears or vanishes as the camera scrolls
+vertically never snaps the picture; a level change or a state restore
+sets the bias directly. The east side keeps `$0AFC`.
+
+### Structural wall continuation
+
+A level map can hold wholly transparent 32x32 metatiles beside a shaft or
+wall that the console can never show: the player, not a camera bound, stops
+there, so no WRAM value tells the host where the reachable region ends. A
+margin reaching such cells showed the backdrop through a hole the console
+never has (crystal mine at camera 448, where the shaft's west wall sits at
+world 448 and the map is empty west of it). The prefill now applies the
+rule DKC1Recomp proved on its Croctopus walls
+(`Dkc2VideoFindStructuralWallSource`): when a margin metatile column is
+transparent from the visible top down through the row (a column empty
+for the whole height, as in the crystal shaft, or one empty above a floor
+that continues past the wall, as in the mine section at camera 256 whose
+neighbouring room showed its backdrop through the void above that
+floor) or the row lies in an empty run at least four metatiles tall that
+a wall seals from the view on every row of the run (the unauthored gap
+between two mine shafts, thirteen rows of void under a ceiling of
+authored rock that the camera scrolls into view first; a porthole or
+doorway is one or two rows, and a flooded hold's water beyond the view
+opens into the view above the crate the rule would otherwise continue
+into it), the first non-empty
+metatile toward the native edge on a row is fully populated and backed by
+another fully populated metatile toward the native center, and an adjacent
+metatile row repeats that empty/full/full relationship (the proving row
+must show the wall two thick as well), the wall is continued
+from that source metatile; any partial metatile in between is an authored
+opening and fails closed. The two extra requirements are what separate a
+void beside a wall from an authored feature: a ship-hold porthole or a
+doorway is an empty metatile with wall above and below it in the same
+column, and a mast, post, or crate standing in open sky is one metatile
+thick. The first cut without them filled Rattle Battle's portholes with
+planks and stacked crates into Topsail's sky; a later cut that let the
+proving row be thin put mast wood into that sky beside a one-cell mast on
+the single row a sign hangs next to it. Metatiles are classified by
+decoding their sixteen tiles and testing each character in live VRAM
+(`Dkc2VideoCharacterIsTransparent`). The rule acts only on margin cells
+outside the cartridge window, under every edge policy, and never on native
+pixels. Where such a column has been corroborated as a wall on any visible
+row, the rows the rule fails closed on (a cave pocket's boundary rows,
+whose edge metatiles are partial) mirror the authored terrain across the
+wall line instead (`Dkc2VideoMirrorSourceTileAcrossEdge`, the reflect
+policy's geometry applied at a held wall): the pocket becomes a symmetric
+hollow in the wall rather than an opening onto the backdrop wider than
+the console ever shows, and rows whose edge metatile is empty mirror the
+open cave, so the pocket's interior stays open.
+
+What a continued cell shows is decided by the level map's own adjacency,
+not by copying the wall's edge column. Copying repeats whatever stands in
+that column once per margin column: a mine's panel of red lamps beside the
+Kongs at a shaft's screen edge appeared three times in a row. The map
+knows what belongs beside each of its metatiles, because the same lamp
+panel sits at the edge of ten other shafts with the level's rock fill to
+its east. A continued cell therefore takes the fully populated metatile
+the map most often places beside the previous one on the outward side
+(`Dkc2VideoMetatileNeighbours`, decoded by id with
+`Dkc2VideoDecodeMetatileEntry`), column by column away from the wall,
+which reproduces the level's own fill sequences (the 128-pixel periodic
+rock of the mines and crystal shafts). A wall row the map never continues
+(the lamp panel's unique upper half) starts its chain from the nearest
+wall row above or below that the map does continue, so the panel is not
+repeated; a wall with no such row at all copies its edge column as
+before. Successors and per-id fills are cached per level and recounted
+every 256 frames, since a level can decompress a new map section into the
+same bank addresses. The trace reports the structural, mirrored, and
+chained counts as `terrain_source.wall`.
+
+The cartridge camera, collision, exits, streaming, and WRAM stay stock under
+every policy; a fine-scroll guard tile outside the extent is verified
+transparent. The former west-reflection and vertical-only east-mask tile
+policies are subsumed: `reflect` mirrors at both boundaries by the same
+rule, and the streamer's guard metatile beyond the extent is never shown.
+
+Exact non-transparent terrain cells seed only missing shadow history, since
+some stage details are legitimately written dynamically by the game. In
+contrast, a decoded character index proven transparent (or an out-of-map cell)
+is actively written as transparent for that world position. The terrain shadow
+gives a live game write from the current or immediately preceding frame priority
+over that clear. This removes stale recycled VRAM in void margin cells without
+replacing active ship/foreground details with the static level map.
+
+That BG1 ownership is not global. The `bg-01` evidence at frames 4,500 and
+4,800 has `$17B6=$7800`, matching BG2's tilemap base while BG1 is `$7000`.
+The adapter therefore matches the live stream destination, masked to its
+`$400`-word tilemap base, against the enabled BG1/BG2 `BGxSC` bases. It keys
+the matching terrain shadow to full camera X and the rendered PPU source Y,
+decodes the decompressed map into that layer, and applies the periodic
+parallax fold to BG2 only when BG2 is not the terrain owner. An unmatched
+destination fails closed instead of guessing a layer.
+
+Map geometry is classified separately from the live level `game_sub_mode` at
+`$0529`. The reference-validated DKC2 main-loop table distinguishes
+horizontal column-major terrain, vertical row-major terrain, and the square
+scroller used by Bramble sub-mode `$10`. Exact prefill uses the corresponding
+address formula; Bramble's square map has 48 metatiles per `$60`-byte row.
+Ship-hold sub-mode `$02` is a separate rolling layout: its NMI handler still
+uploads level rows and columns, but its decompressed source is row-major with
+80 metatiles (`$A0` bytes) per row. Lockjaw's Locker's preserved exact state
+matched 957/957 sampled visible BG1 cells with that formula. It therefore uses
+the normal world-keyed shadow/prefill path rather than exposing the recycled
+64-column VRAM ring as a static map.
+Wasp-hive sub-mode `$03` normally calls `square_level_scroll_handler` at
+`$B5:B54A`, so ordinary hive rooms share the 48-metatile/`$60`-byte source-row
+decoder. Parrot Chute Panic is a separately proven exception: level `$0013`
+takes the alternate `$B5:B317` path. Its 512-pixel map has 16 metatiles per
+`$20`-byte row, and its live terrain target selects BG2 `$7800`. The scene
+classifier therefore combines sub-mode and level identity rather than forcing
+all hive rooms through Parrot's formula. Ordinary hive widening is explicitly
+experimental until Hornet Hole, Rambi Rumble, and King Zing have route and
+per-layer acceptance. Other square or special main loops still return
+`unknown` and force a centered 256-column guest frame; a temporary 64-column
+`BGxSC` value alone does not opt a screen into widescreen.
+
+That Y choice is also required for history correctness. DKC2's terrain
+tilemap is staged one 256-pixel page above camera Y. The `bg-02` route proved
+that prefill/lookup already used that source-row domain while native viewport
+capture and subsequent VRAM writes were still recorded under raw camera rows.
+During vertical movement those misplaced historical cells could later win
+over exact decoded cells. The selected terrain layer now unwraps the rendered
+PPU tile origin near camera Y once, restores the fine three-bit phase, and uses
+that result for capture, write history, lookup, and prefill. Masking before the
+unwrap is required at the exact 512-pixel tie: otherwise the fine value and
+tile-aligned prefill can select opposite 1,024-pixel epochs. Because selection
+still comes from live `$17B6`, the correction
+applies to standard rolling terrain on either BG1 or BG2 without a level ID.
+
+Every other presentation decision is a property of the live PPU geometry
+rather than a level identity; the adapter keeps no list of scenes.
+
+A background is *bounded* when its tilemap is 32 columns wide, or when its
+64-column allocation is not physically its own: the extension page of a
+64-column map that is another enabled background's base page (Mudhole Marsh
+BG3 `$6D` extends from `$6C00` into BG1's `$7000` map) holds that other
+layer's rows, so `Dkc2VideoTilemapPagesCollide` classifies it as bounded.
+Every enabled bounded background repeats its rendered native scanline into
+the margins, where "enabled" is the union of the frame-start TM/TS and every
+HDMA band's (the ship hold's BG3 water surface is switched on only inside
+its band, with TM zero at frame start; read from the frame-start registers
+alone it was neither wide nor repeated and stopped at the 4:3 edges). That
+is exactly what a wider PPU would draw from a map that wraps at 256 pixels: HDMA phase, hardware windows, and color-math
+participation are already in the rendered line, and the isolated-layer merge
+cannot expose unwritten VRAM. This one rule covers the ship-hold water,
+Topsail rain, Mainbrace and Krow's Nest cloud/lighting planes, Mudhole's
+forest silhouettes, Parrot Chute Panic's hive backdrops, the lava-stage BG3
+effect plane, and any bounded layer in a room that has never been audited.
+An enabled 64-column BG3 whose pages are its own renders its authentic
+adjacent columns after the terrain gate, which covers the Pirate Panic and
+Rattle Battle rigging.
+
+A 32-column map wraps at 256 pixels on hardware, so its repeated line keeps
+exactly that period. A bounded backdrop kept in a 64-column allocation has
+no hardware wrap to fall back on, so for the 64-column BG1/BG2 layers the
+shared PPU continues each repeated line at the period that line's own
+rendered interior (X=7-248) proves at least twice, up to 120 pixels, and
+keeps the 256-pixel repeat when no period is provable
+(`PpuSetWidescreenLayerRepeatAutoPeriod`). A ship-hold cabin wall is periodic
+in rendered pixels at 96 pixels even though its tilemap uses a distinct
+character index per column, so tile-level checks cannot see it; the pixel
+rule reproduces the former hand-tuned 96-pixel continuation on every
+periodic row and leaves the non-periodic picture rows at 256. The same
+layers rebuild their seven endpoint pixels from that period, because only a
+64-column ring can show stale fine-scroll columns. The rule is not applied
+to 32-column maps, whose 256-pixel wrap is what the console itself shows
+once the layer scrolls; the lava stage's BG3 plane has an authored seam at
+its wrap, and the margins reproduce it rather than invent a continuation.
+
+Rolling 64-column BG1/BG2 layers are classified per scanline band. Before
+drawing, the adapter walks the HDMA tables the cartridge has already built
+for the frame (`runner/dkc2_hdma.c` mirrors the runner's own table walk,
+including the BG offset write latch, TM, and TS) and records the exact BG
+scroll and screen-enable values every rendered line will use; consecutive
+lines with identical values form a band. For each wide layer and band, the
+layer is at the *terrain phase* when its band scroll is within the measured
+lead tolerance (six pixels horizontally, four vertically) of the scroll the
+live terrain owner rendered at the frame anchor. A terrain-phase band is
+served from the world-keyed store: the owner reads its own store, and the
+other physical layer reads the owner's store through a read-only alias view
+(`WsShadowSetEntryAlias`) that shares the owner's keys, so the renderer's
+per-line scroll delta selects the exact world cell without any backup or
+restore of shadow cells. Any other band repeats its rendered line. The
+lava-stage HDMA compositions, in which BG1 displays the streamed map in an
+upper band while BG2 displays it below and each layer shows a lava plane in
+the other band, follow from this rule with no swap direction, composition
+signature, sticky state, or per-scanline detector. When no terrain owner or
+exact prefill is available the wide layers are clamped, so an unproven
+rolling layer shows no margin content rather than raw recycled VRAM, and
+the host paints both margins black after the frame rather than letting
+the PPU's backdrop color show there (Barrel Bayou's level intro, a static
+picture on BG1's own map with no terrain stream, sets that color to pure
+blue; the console never shows it).
+
+Under the `shift` policy the presentation bias makes the presented 4:3
+region straddle the PPU's own margin boundary near a level endpoint: a bias
+of +43 places the first 43 columns of the authentic viewport left of screen
+X=0. A repeated layer therefore renders those columns from real VRAM,
+exactly as the unbiased frame would, and applies its repeat or period
+continuation only beyond them (`PpuWidescreenRepeatAuthenticExtra`). The
+presented 4:3 region never depends on a repeat approximation under any
+policy.
+
+Other modes and screens composed only from bounded 32-column tilemaps are
+rendered as the authentic 256 columns centered in the same 342-column buffer.
+The adapter clears those side columns before drawing so a wide gameplay frame
+cannot survive as stale host pixels on a following menu or room. Bounded-screen
+reconstruction remains screen-specific future work; repeating a title or room
+is not accepted as widescreen.
+
+DKC2's common object behavior is adapted at two independently identified game
+boundaries. The placement-radius loader expands its left allowance by the
+per-side margin and its total horizontal span by twice that amount. Both paths
+in the shared world-sprite renderer use the same transformation. With
+widescreen disabled the helpers return the cartridge constants exactly. In
+widescreen mode they also fail closed to those native constants until exact
+terrain prefill succeeds for the current scene, preventing objects from being
+activated over unavailable terrain.
+Generated game C remains private and disposable: the source-owned
+`scripts/apply_dkc2_widescreen_overrides.py` locates the named generated
+functions, verifies every expected anchor, applies the calls idempotently, and
+fails regeneration if SNESrecomp output changes unexpectedly.
+
+Bananas bypass both common boundaries. DKC2 walks a compact banana-list and
+writes its compound tiles directly to OAM. The source-owned regeneration
+adapter therefore also widens the four constants in the dedicated banana
+index/render/clip routines, gated by the same terrain-readiness contract. The
+fourth constant is a renderer-local negative-X allowance: native DKC2 accepts
+15 pixels beyond the left edge, while ready widescreen terrain accepts those
+15 pixels plus the 43-pixel host margin. This is distinct from list activation
+and from the formation span, and remains byte-for-byte native in 4:3. The
+original OAM packer obtains its high-X bit from coordinate bit 15 because the
+native viewport only needed negative off-left positions. For the widened
+right margin, `Dkc2VideoPromoteOamXHigh` mirrors coordinate bit 8 into bit 15
+immediately before that original packer; native mode and unready terrain are
+unchanged. The transformation is deliberately restricted to the two banana
+OAM writes rather than changing general PPU coordinate semantics.
+
+The pre-boot launcher and in-game pause overlay edit the same persisted
+`widescreen` setting. Switching at runtime clears both host frame buffers,
+changes the PPU pitch, and recomputes the presenter viewport. It does not enter
+SNES save states, SRAM, input recordings, or deterministic 4:3 hashes.
+
+Widescreen diagnosis is a separate developer boundary. The trace-only
+`scripts/capture_widescreen_diagnostics.py` repeats a deterministic frame with
+host layer masks and exports private evidence under an ignored directory. It
+does not add instrumentation to guest execution. Its DKC2 decoder reads only
+documented camera, sprite-table, and render-table WRAM fields; it keeps a game
+sprite record distinct from the compound OAM tiles that record may emit.
+Automatic findings follow the data path from active game sprite to
+render-consumed OAM to isolated OBJ pixels. Background findings measure
+non-backdrop pixels in each margin independently. This classification narrows
+investigation but cannot certify that a non-empty tile, position, priority, or
+animation is correct. Reports also expose a logical top-left 43x64 region; the
+private Pirate Panic route regression checks that BG1 region at frame 6,750
+without committing ROM-derived images or recordings.
+
+Route-scale widescreen diagnosis is a second, temporal layer implemented by
+`scripts/audit_widescreen_route.py`. The headless host emits opt-in JSON lines
+under `DKC2_WIDESCREEN_TRACE`; these contain host-observed PPU state
+(including the presentation bias, the visible per-side margins, and the
+number of HDMA scanline bands), documented DKC2 WRAM fields, and read-only
+projections of the world-keyed terrain store. The shared shadow runtime accounts the final source of every
+margin miss as periodic fold, verified blank, or raw rolling-VRAM fallback.
+The last category is the direct stale-VRAM hazard. Its diagnostic lookup reads
+a world tile without changing renderer counters or behavior.
+
+`scripts/check_widescreen_state_corpus.py` is the third layer: it replays
+every preserved Quick Save at 4:3 and at each wide aspect, in composite and
+per-layer isolation, and checks that the presented native viewport equals the
+4:3 render (bias-aware, with the seven endpoint pixels reported separately),
+that visible margins of a visibly enabled layer are not blank, that the old
+4:3 boundary is not a persistent discontinuity, that no margin lookup fell
+through to raw rolling VRAM, and that every replay completed. An optional
+reference directory turns it into a before/after comparison, so a general
+rule is validated against every previously accepted case at once. The
+optional `DKC2_STATE_CORPUS` CMake path registers it as a private CTest.
+
+The offline analyzer reruns deterministic composite/BG/OBJ presentations,
+compares exact terrain-entry identity as a cell crosses between a margin and
+the authentic viewport, scores discontinuities at the former 4:3 edges, and
+tracks placed-object activation/despawn around those boundaries. It does not
+modify guest memory, VRAM, input, timing, or save state. Raw PPMs and derived
+BMP/JSON/HTML evidence remain ignored/private. Image scores and object
+lifetime rules are candidate generators; only raw fallback and observed tile
+identity are exact machine facts, and neither alone establishes artistic
+intent.
+
+The terrain trace includes aggregate `[expected, present, matching]` counts
+for the complete decoded viewport and a separate margin-only triple. The
+margin presence count is a same-frame provenance proof: each cell came from
+the decoded map or a newer cartridge tilemap write. This supersedes comparing
+an animated cell with a different frame. Old-boundary seam candidates require
+persistence across adjacent samples. They are not suppressed merely because
+the affected screen has complete source provenance: source ownership does not
+prove that the margin used the same presentation phase as the native center.
+Verified-transparent
+fallbacks remain visible as safe observations but do not inflate the
+actionable finding count.
+
+Terrain X and Y presentation are keyed from PPU-latched scroll values unwrapped
+near the WRAM camera. The WRAM camera may lead the PPU during an NMI boundary;
+using it directly for the margins while the center consumes latched hScroll
+creates a transient split at X=43/X=299. Prefill limits, margin classification,
+shadow capture, and margin lookup therefore share the rendered X coordinate.
+
+Vertical address resolution has two distinct domains. The shadow key first
+masks the PPU phase to its 8-pixel tile origin, unwraps that origin once near
+camera Y, restores the fine phase, and advances every row continuously. Direct
+fine-value unwrapping at the exact half-period tie, or independent unwrapping
+per row, can select opposite 1,024-pixel epochs. The
+decompressed map address uses the PPU's low-eight-bit phase nearest
+`cameraY-$0100`, matching the cartridge column builders for every currently
+proven rolling layout. Keeping those domains separate prevents both
+cross-row discontinuities and wrong source-page reconstruction.
+
+Input recording is a host-only component shared by the playable Win32 and SDL
+front ends through `runner/input_recording.{c,h}`. It samples the final
+controller word once for every emulated frame and emits a fixed six-hex-digit
+line. Opening occurs before the frame loop, LF output is byte-stable across
+platforms, and all open/write/flush/close failures are surfaced to the user.
+It does not modify guest memory or participate in save states. The stream
+currently contains controller samples only: it does not encode rewind,
+save-state creation, or save-state loading. Rewind can restore older guest
+state while host recording continues forward, so any route that uses rewind
+or loads a state is not exactly reproducible from the input and starting SRAM
+alone. Fast forward remains deterministic because each emulated frame still
+receives and records one sample.
+
+`scripts/create_private_diagnostic_version.ps1` is a deployment wrapper around
+that boundary, not a new runtime architecture. It assembles a private,
+external, append-only kit and preserves the SRAM that existed at recording
+start beside each route. That paired SRAM is supplied to deterministic replay,
+preventing later personal progress from changing a diagnostic run. ROMs,
+saves, recordings, memory dumps, and captures remain outside Git.

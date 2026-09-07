@@ -1,0 +1,48 @@
+# Third-party notices
+
+The release executable and launcher use the following third-party components
+and identifying artwork. Their inclusion does not grant rights to Nintendo or
+Rare game content.
+
+- Dear ImGui — MIT license; copyright Omar Cornut and contributors. The exact
+  license text is shipped as `licenses/DearImGui-LICENSE.txt`.
+- SDL2 — zlib license. The installed runtime's license is shipped as
+  `licenses/SDL2-LICENSE.txt`.
+- GCC runtime libraries and winpthreads — GNU licenses with the GCC Runtime
+  Library Exception where applicable. The installed runtime notices are
+  shipped under `licenses/`.
+- Lato Latin fonts — SIL Open Font License 1.1. The OFL text is shipped as
+  `licenses/Lato-OFL.txt`.
+- LakeSnes-derived APU/S-DSP code — MIT license; copyright angelo_wf and
+  contributors. The license is shipped as `licenses/LakeSnes-LICENSE.txt`.
+- Additional framework attribution is shipped as
+  `licenses/snesrecomp-THIRD_PARTY_ATTRIBUTION.md`.
+
+The generic launcher chrome and controller diagrams come from the pinned
+`recomp-ui` project.
+
+The launcher includes the North American retail cover for *Donkey Kong Country
+2: Diddy's Kong Quest*. The image was obtained from the libretro thumbnail
+collection and is included only to identify the supported game and region.
+The cover art and associated trademarks remain copyright Nintendo and Rare;
+this project claims no ownership. Source and conversion details are recorded
+in `recomp/launcher/README.md`.
+
+DKC2Recomp does not stage or ship ROM data, extracted in-game graphics, music,
+save files, screenshots, audio captures, or generated ROM-derived source.
+
+
+## Android port additions
+
+- **SDL 2.30.9** (https://github.com/libsdl-org/SDL, zlib license) —
+  statically linked into `libdkc2.so`; the Java activity glue
+  (`android/app/src/main/java/org/libsdl/app/`) is vendored unmodified
+  from the SDL2 2.30.9 `android-project`.
+- **recomp-ui** — vendored at the pinned revision (`ad2f3e2`, MIT,
+  Matthew Stanley) instead of remaining a submodule because the Android
+  port carries one local adaptation: `src/common/launcher_files.c` guards
+  the posix_spawn-based Linux desktop dialogs off on `__ANDROID__`
+  (bionic exposes posix_spawn only from API 28; the launcher UI is not
+  used on Android). All other recomp-ui files are unmodified.
+- The `snesrecomp` submodule remains at its upstream pinned revision with
+  no local modifications.
