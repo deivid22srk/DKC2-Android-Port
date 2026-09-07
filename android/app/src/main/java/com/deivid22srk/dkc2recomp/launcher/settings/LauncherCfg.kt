@@ -105,9 +105,9 @@ object LauncherCfg {
                 for ((key, value) in entries) {
                     if (key.isEmpty() || key.length > MAX_KEY_LENGTH || key.contains('=')) continue
                     writer.write(key)
-                    writer.write('=')
+                    writer.write("=")
                     writer.write(value.toString())
-                    writer.write('\n')
+                    writer.write("\n")
                 }
             }
             if (target.exists()) target.delete()
