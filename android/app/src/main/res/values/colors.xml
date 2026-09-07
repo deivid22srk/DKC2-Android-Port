@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="ic_launcher_background">#1B3A2A</color>
+    <!-- Janela escura do launcher (Theme.PortScreen) — evita flash claro no cold start. -->
+    <color name="window_bg">#FF07070C</color>
 </resources>

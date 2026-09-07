@@ -14,16 +14,28 @@
         android:isGame="true"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
 
+        <!-- Tela inicial (front-end Compose adaptado do Port Screen Template):
+             seleção/validação da ROM, configurações e créditos. Abre imersiva
+             e adaptativa (portrait/landscape). -->
         <activity
-            android:name=".MainActivity"
+            android:name=".launcher.LauncherActivity"
             android:exported="true"
-            android:screenOrientation="sensorLandscape"
-            android:resizeableActivity="false"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density|smallestScreenSize|navigation|locale|layoutDirection|fontScale|colorMode|keyboard|touchscreen">
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+        </activity>
+
+        <!-- Host SDL do jogo. Sem intent-filter: só é iniciada pelo launcher
+             depois que a ROM está staged e verificada (filesDir/rom.sfc).
+             Mantém o picker interno como fallback de robustez. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:resizeableActivity="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density|smallestScreenSize|navigation|locale|layoutDirection|fontScale|colorMode|keyboard|touchscreen">
             <meta-data
                 android:name="android.app.lib_name"
                 android:value="dkc2" />

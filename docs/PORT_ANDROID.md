@@ -17,10 +17,10 @@ exactly like the desktop releases.
 | --- | --- |
 | ABI | arm64-v8a only |
 | Minimum Android | 8.0 (API 26) |
-| Target Android | 14 (API 34) |
+| Target Android | 14 (API 34, compileSdk 35) |
 | ROM | DKC2 USA v1.0, 4 MiB headerless, SHA-256 `35421a9a…` |
 | NDK | r27 (27.2.12479018) |
-| CMake | 3.31.6 (SDK), Gradle 8.9, AGP 8.7.3, JDK 21 |
+| CMake | 3.31.6 (SDK), Gradle 8.9, AGP 8.7.3, Kotlin 2.0.21, JDK 21 |
 
 ## Repository layout added by the port
 
@@ -29,8 +29,15 @@ android/                    Gradle project (app module + wrapper)
 android/CMakeLists.txt      native build: runner + generated AOT + SDL2 + recomp-ui
 android/app/src/main/java/org/libsdl/app/   SDL2 2.30.9 Java glue (vendored)
 android/app/src/main/java/com/deivid22srk/dkc2recomp/
-    MainActivity.java       SAF ROM picker, JNI bridge, library wiring
+    MainActivity.java       SDL host: SAF picker (fallback), JNI bridge, wiring
     TouchControlsView.java  on-screen SNES controls (virtual gamepad client)
+android/app/src/main/java/com/deivid22srk/dkc2recomp/launcher/
+    LauncherActivity.kt     home screen (Port Screen Template, Compose):
+                            immersive front-end + navigation + game hand-off
+    config/PortBrandingConfig.kt   single branding edit point (DKC2 identity)
+    data/RomStager.kt       copy + SHA-256 gate mirroring verified_rom.c
+    data/GameDataScanner.kt folder scan (exact names → extensions)
+    viewmodel/…, settings/…, ui/…   phases, persisted preferences, AAA scene
 runner/android_main.c       SDL_main entry (chdir to app storage, ROM argv)
 runner/android_virtualpad.c SDL2 virtual gamepad behind the touch overlay
 runner/desktop_present_sdl.c  __ANDROID__ GLES2 branches (see below)
@@ -78,6 +85,18 @@ recomp-ui/                  vendored at the pinned revision, plus one
 7. **Paths.** `posix_spawn`-free builds also avoid the executable-relative
    anchor: settings, `rom.cfg`, and `saves/` land in internal storage
    root (writable, backed up with `allowBackup`).
+8. **Home screen (launcher).** A Compose front-end adapted from the Port
+   Screen Template is the app entry (`launcher.LauncherActivity`); the SDL
+   host (`MainActivity`) is no longer the launcher and is started only
+   with the ROM already staged. The screen is immersive edge-to-edge,
+   adapts to portrait and landscape, and offers file picking (bare
+   `*/*` — no `EXTRA_MIME_TYPES`, keeping the grey-out fix), folder
+   scanning (`.sfc/.smc/.fig/.swc`), a persisted folder grant, a
+   dedicated Settings screen (SharedPreferences, ready to wire into the
+   engine) and credits with porter links. `RomStager` validates the pick
+   with the exact native gate (header skip, 4 MiB, SHA-256) and swaps
+   `rom.sfc` atomically; a staged file re-verified at boot short-circuits
+   to the "ready" state without touching SAF.
 
 ## Building locally
 

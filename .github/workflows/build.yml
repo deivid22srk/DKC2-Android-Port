@@ -37,6 +37,7 @@ jobs:
           "$SDKM" --install \
             "platform-tools" \
             "platforms;android-34" \
+            "platforms;android-35" \
             "build-tools;34.0.0" \
             "ndk;27.2.12479018" \
             "cmake;3.31.6"

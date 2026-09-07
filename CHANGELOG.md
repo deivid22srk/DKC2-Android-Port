@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.0.9-android
+
+New visual front-end: the Port Screen Template (Kotlin + Jetpack Compose,
+v1.1 quality bar) is adapted as the app's home screen, ahead of the SDL
+host. Native game code untouched.
+
+- **Launcher screen.** `LauncherActivity` (new, Compose) becomes the
+  launcher entry: cinematic layered background with parallax + film grain,
+  ambient ember particles, animated golden title, glassmorphism primary
+  button, status area with per-phase icon/color/micro-animation, tech chip
+  (engine · GLES · ABI), dedicated Settings screen and a "Portado por
+  Hailgames" credits dialog. Runs immersive edge-to-edge, adapts to
+  portrait and landscape (two-column layout ≥ 560 dp), and respects the
+  system "remove animations" accessibility setting.
+- **ROM flow with native-parity validation.** `RomStager` mirrors
+  `runner/verified_rom.c` exactly — streaming copy, 512-byte copier-header
+  skip, exact 4 MiB payload, pinned SHA-256 — so "ROM verificada" means
+  the native runtime will accept the file. Primary button picks a single
+  file (`ACTION_OPEN_DOCUMENT`, bare `*/*`, no EXTRA_MIME_TYPES — the SAF
+  grey-out fix preserved); a secondary button picks a folder that is
+  scanned by extension and staged by hash, so only the supported dump
+  validates when several ROMs live in one folder. Persisted tree grant
+  survives reboots and is silently revalidated on boot; a staged ROM with
+  a valid hash short-circuits straight to "pronto" without SAF.
+- **Atomic swap + self-healing.** The staged `rom.sfc` is replaced only
+  after full verification (temp file + rename); a corrupt or truncated
+  staging copy is removed on next boot instead of being reused.
+- **Activity split.** `MainActivity` (SDL) loses the launcher
+  intent-filter (`exported=false`, landscape unchanged) and keeps its
+  in-game picker as a fallback; the native first-run wait loop stays as
+  defense in depth. "Iniciar Jogo" hands off to the SDL host which boots
+  from the staged path with no duplicate copy.
+- **Build.** Kotlin 2.0.21 + Compose compiler plugin added (AGP 8.7.3,
+  Gradle 8.9 unchanged); compileSdk 35 (androidx requirement),
+  targetSdk stays 34; CI installs `platforms;android-35`. versionCode 5.
+- **Branding.** Own cinematic key art (night jungle, ruins, mist, torch
+  glow — no franchise assets), gold-amber palette, ember particles, and
+  credits linking the base project (mstan/DKC2Recomp).
+
 ## 0.0.7-android
 
 Device-validated fix round from the moto g34 5G diagnostics (logcat,
