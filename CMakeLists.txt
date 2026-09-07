@@ -30,6 +30,10 @@ set(DKC2_DESKTOP_ICON "" CACHE FILEPATH
     "Optional private ICO embedded in the Windows desktop executable")
 option(DKC2_BUILD_SNESRECOMP
     "Build the experimental snesrecomp headless and desktop runners" OFF)
+option(DKC2_HEADLESS_ONLY
+    "Headless-only build: skip the SDL desktop runner and the recomp-ui
+launcher (no system OpenGL requirement); keeps dkc2_verify/analyze/boot
+and dkc2_snesrecomp_headless" OFF)
 option(DKC2_BUILD_SNESRECOMP_HEADLESS
     "Deprecated alias for DKC2_BUILD_SNESRECOMP" OFF)
 option(DKC2_FETCH_SDL2
@@ -155,7 +159,9 @@ if(DKC2_BUILD_SNESRECOMP)
         FetchContent_MakeAvailable(SDL2)
     endif()
     set(SNESRECOMP_SDL_BACKEND SDL2)
-    include(${CMAKE_CURRENT_SOURCE_DIR}/recomp-ui/recomp_ui.cmake)
+    if(NOT DKC2_HEADLESS_ONLY)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/recomp-ui/recomp_ui.cmake)
+    endif()
     file(GLOB DKC2_SNESRECOMP_GEN_SOURCES CONFIGURE_DEPENDS
         "${DKC2_SNESRECOMP_GEN_DIR}/*.c")
     if(NOT DKC2_SNESRECOMP_GEN_SOURCES)
@@ -189,6 +195,11 @@ if(DKC2_BUILD_SNESRECOMP)
         SYSTEM_VOLUME_MIXER_AVAILABLE=0)
     target_link_libraries(dkc2_snesrecomp_headless PRIVATE
         ${SNESRECOMP_RUNNER_LIBRARIES})
+    if(UNIX)
+        # cx4 (and the DSP helpers) use libm; the SDL host links it through
+        # its own block, the headless runner and its tests need it here.
+        target_link_libraries(dkc2_snesrecomp_headless PRIVATE m)
+    endif()
     dkc2_enable_project_warnings(dkc2_snesrecomp_headless)
     dkc2_enable_release_optimization(dkc2_snesrecomp_headless)
 
@@ -262,39 +273,43 @@ if(DKC2_BUILD_SNESRECOMP)
             OUTPUT_NAME DKC2Recomp)
         # Shared Dear ImGui pre-boot launcher with the North American retail
         # cover used to identify the required ROM region.
-        recomp_target_launcher_ui(dkc2_snesrecomp_desktop
-            CONSOLE snes
-            BOXART ${CMAKE_SOURCE_DIR}/recomp/launcher/boxart.tga)
+        if(NOT DKC2_HEADLESS_ONLY)
+            recomp_target_launcher_ui(dkc2_snesrecomp_desktop
+                CONSOLE snes
+                BOXART ${CMAKE_SOURCE_DIR}/recomp/launcher/boxart.tga)
+        endif()
         dkc2_enable_project_warnings(dkc2_snesrecomp_desktop)
         dkc2_enable_release_optimization(dkc2_snesrecomp_desktop)
     endif()
 
-    # Cross-platform playable host. The established Win32 executable remains
-    # available while this SDL2 host is validated on each native platform.
-    add_executable(dkc2_snesrecomp_sdl
-        ${SNESRECOMP_RUNNER_SOURCES}
-        ${DKC2_SNESRECOMP_GEN_SOURCES}
-        runner/dkc2_game.c
-        runner/dkc2_video.c
-        runner/dkc2_hdma.c
-        runner/diagnostics.c
-        runner/headless_host.c
-        runner/verified_rom.c
-        runner/desktop_filter.c
-        runner/desktop_fps.c
-        runner/desktop_input.c
-        runner/input_recording.c
-        runner/desktop_launcher.c
-        runner/desktop_overlay.cpp
-        runner/desktop_overlay_model.c
-        runner/desktop_present_sdl.c
-        runner/desktop_vsync.c
-        runner/desktop_rewind.c
-        runner/desktop_viewport.c
-        runner/desktop_pacer.c
-        runner/desktop_audio_rate.c
-        runner/sdl_main.c
-        ${SNESRECOMP_ROOT}/runner/src/host_report.c)
+    if(NOT DKC2_HEADLESS_ONLY)
+        # Cross-platform playable host. The established Win32 executable
+        # remains available while this SDL2 host is validated on each
+        # native platform.
+        add_executable(dkc2_snesrecomp_sdl
+            ${SNESRECOMP_RUNNER_SOURCES}
+            ${DKC2_SNESRECOMP_GEN_SOURCES}
+            runner/dkc2_game.c
+            runner/dkc2_video.c
+            runner/dkc2_hdma.c
+            runner/diagnostics.c
+            runner/headless_host.c
+            runner/verified_rom.c
+            runner/desktop_filter.c
+            runner/desktop_fps.c
+            runner/desktop_input.c
+            runner/input_recording.c
+            runner/desktop_launcher.c
+            runner/desktop_overlay.cpp
+            runner/desktop_overlay_model.c
+            runner/desktop_present_sdl.c
+            runner/desktop_vsync.c
+            runner/desktop_rewind.c
+            runner/desktop_viewport.c
+            runner/desktop_pacer.c
+            runner/desktop_audio_rate.c
+            runner/sdl_main.c
+            ${SNESRECOMP_ROOT}/runner/src/host_report.c)
     if(APPLE)
         enable_language(OBJC)
         target_sources(dkc2_snesrecomp_sdl PRIVATE
@@ -426,6 +441,7 @@ if(DKC2_BUILD_SNESRECOMP)
                 "result=desktop_completed frames=90.*save_load=passed.*host=sdl2"
             TIMEOUT 30)
     endif()
+    endif() # DKC2_HEADLESS_ONLY guard around the SDL desktop runner
 
     if(BUILD_TESTING AND WIN32 AND DKC2_ROM)
         add_test(NAME supplied_rom_snesrecomp_smoke
@@ -954,6 +970,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/snesrecomp/runner/src/snes)
         target_compile_definitions(test_snesrecomp_interp_bridge PRIVATE
             SNESRECOMP_TIER2_TEST=1)
+        if(UNIX)
+            # cx4's trig helpers pull in libm on Linux builds.
+            target_link_libraries(test_snesrecomp_interp_bridge PRIVATE m)
+        endif()
         dkc2_enable_project_warnings(test_snesrecomp_interp_bridge)
         add_test(NAME snesrecomp_interp_bridge
             COMMAND test_snesrecomp_interp_bridge)

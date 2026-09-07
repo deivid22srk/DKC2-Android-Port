@@ -188,9 +188,22 @@ static void CloseControllers(SdlHost *host) {
 static void RefreshControllers(SdlHost *host) {
   CloseControllers(host);
   int opened = 0;
+#ifdef __ANDROID__
+  /* Open the virtual touch pad first so an OEM joystick occupying device
+   * index 0 can never push it out of the kMaximumControllers window. */
+  int virtual_index = Dkc2AndroidVirtualPadDeviceIndex();
+  if (virtual_index >= 0 && virtual_index < SDL_NumJoysticks() &&
+      SDL_IsGameController(virtual_index)) {
+    SDL_GameController *controller = SDL_GameControllerOpen(virtual_index);
+    if (controller) host->controllers[opened++] = controller;
+  }
+#endif
   for (int device = 0;
        device < SDL_NumJoysticks() && opened < kMaximumControllers;
        device++) {
+#ifdef __ANDROID__
+    if (device == virtual_index) continue;
+#endif
     if (!SDL_IsGameController(device)) continue;
     SDL_GameController *controller = SDL_GameControllerOpen(device);
     if (controller) host->controllers[opened++] = controller;
@@ -200,6 +213,21 @@ static void RefreshControllers(SdlHost *host) {
 static void PumpEvents(SdlHost *host) {
   SDL_Event event;
   while (SDL_PollEvent(&event)) {
+#ifdef __ANDROID__
+    /* One-line lifecycle + queue telemetry in logcat: invisible failures
+     * (resume gaps, underruns, stale backlog) were impossible to diagnose
+     * from a device report before. */
+    if (event.type == SDL_APP_WILLENTERBACKGROUND)
+      SDL_Log("audio: backgrounding, queued=%u bytes",
+              host->audio_available
+                  ? (unsigned)SDL_GetQueuedAudioSize(host->audio_device)
+                  : 0u);
+    if (event.type == SDL_APP_DIDENTERFOREGROUND)
+      SDL_Log("audio: foreground, queued=%u bytes",
+              host->audio_available
+                  ? (unsigned)SDL_GetQueuedAudioSize(host->audio_device)
+                  : 0u);
+#endif
     if (event.type == SDL_KEYDOWN && event.key.repeat == 0 &&
         event.key.keysym.scancode == SDL_SCANCODE_ESCAPE &&
         Dkc2DesktopEscapeExitsFullscreen(
@@ -263,9 +291,18 @@ static bool IsSdlScancodePressed(int scancode, void *context) {
 
 static SdlControls ReadControls(SdlHost *host) {
   SdlControls controls = {0, 0};
+#ifdef __ANDROID__
+  /* Android focus flickers across rotation/overlay windows and the
+   * first focus-gained can land before the SDL window exists; gating on
+   * SDL_WINDOW_INPUT_FOCUS zeroed all input during those windows. The
+   * single game window is always the one on screen here, so only the
+   * hidden check applies. */
+  if (host->hidden) return controls;
+#else
   SDL_Window *window = (SDL_Window *)host->presenter.window;
   if (!host->hidden && !(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS))
     return controls;
+#endif
   const Uint8 *keys = SDL_GetKeyboardState(NULL);
   uint32_t keyboard[kDkc2DesktopPlayerCount];
   for (int player = 0; player < kDkc2DesktopPlayerCount; player++)
@@ -330,13 +367,41 @@ static bool InitializeAudio(SdlHost *host) {
    * earlier 2048. */
   desired.samples = 1024;
   host->audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
-  if (!host->audio_device) return false;
+#ifdef __ANDROID__
+  if (!host->audio_device && obtained.freq == 0) {
+    /* Some Android devices refuse odd cartridge rates outright; the ring
+     * resamples onto whatever rate is reported, so fall back to 48 kHz
+     * rather than leaving the game muted. S16/stereo stay strict. */
+    SDL_zero(desired);
+    SDL_zero(obtained);
+    desired.freq = 48000;
+    desired.format = AUDIO_S16SYS;
+    desired.channels = kAudioChannels;
+    desired.samples = 1024;
+    host->audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
+    if (host->audio_device)
+      SDL_Log("audio: cartridge rate refused, reopened at %d Hz",
+              obtained.freq);
+  }
+#endif
+  if (!host->audio_device) {
+    SDL_Log("audio: open failed: %s", SDL_GetError());
+    return false;
+  }
   if (obtained.freq != desired.freq || obtained.format != desired.format ||
       obtained.channels != desired.channels) {
     SDL_CloseAudioDevice(host->audio_device);
     host->audio_device = 0;
+    SDL_Log("audio: unsupported obtained spec (%d Hz fmt=%.4x ch=%d)",
+            obtained.freq, (unsigned)obtained.format, obtained.channels);
     return false;
   }
+  /* The runtime ring resamples onto the device rate; hook it up so a
+   * non-cartridge fallback rate above stays pitch-correct. */
+  RtlSetAudioOutputRate(obtained.freq);
+  SDL_Log("audio: driver=%s spec=%d Hz s16/%dch samples=%d",
+          SDL_GetCurrentAudioDriver(), obtained.freq, obtained.channels,
+          obtained.samples);
   SDL_PauseAudioDevice(host->audio_device, 0);
   host->audio_available = true;
   host->audio_device_frames = (int)obtained.samples;
@@ -375,8 +440,20 @@ static bool QueueAudio(SdlHost *host, const int16_t *samples, int frames,
           (int16_t)(((int)output[i] * host->audio_volume) / 100);
     output = host->scaled_audio;
   }
-  return SDL_QueueAudio(host->audio_device, output,
-                        (Uint32)(sample_count * sizeof output[0])) == 0;
+  if (SDL_QueueAudio(host->audio_device, output,
+                     (size_t)frames * kAudioChannels * sizeof(int16_t)) != 0) {
+    /* Transient queue overflow: shed the stale backlog once and retry
+     * before giving up, so a single hiccup cannot mute the rest of the
+     * session. */
+    SDL_ClearQueuedAudio(host->audio_device);
+    if (SDL_QueueAudio(host->audio_device, output,
+                       (size_t)frames * kAudioChannels *
+                           sizeof(int16_t)) != 0) {
+      host->audio_available = false;
+      return false;
+    }
+  }
+  return true;
 }
 
 static void ResetAudio(SdlHost *host) {
@@ -714,6 +791,12 @@ static int RunGame(const char *rom_path,
     return 4;
   }
 #ifdef __ANDROID__
+  /* SDL overrides the manifest orientation when the window is created:
+   * without this hint a resizable window becomes FULL_USER (freely
+   * rotatable), which rotates the game to portrait mid-session and
+   * destroys/recreates the EGL surface. Re-declare the landscape lock
+   * through SDL's own hint so the Java glue requests sensorLandscape. */
+  SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
   /* The touch overlay drives a virtual SDL gamepad, so it must exist before
    * the input scan sees devices. Physical gamepads keep hotplugging in. */
   Dkc2AndroidVirtualPadInit();

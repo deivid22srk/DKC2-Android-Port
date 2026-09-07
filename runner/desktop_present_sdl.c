@@ -75,6 +75,14 @@ typedef struct Dkc2GlShaderApi {
 
 static Dkc2GlShaderApi s_gl;
 
+#ifdef __ANDROID__
+/* Fullscreen-quad VBO handle created at Init (GLES2 core entry points are
+ * link-time symbols here, unlike the desktop path which resolves them). */
+static GLuint s_quad_vbo;
+static const GLfloat kQuadVertices[24];
+static void LogGlErrorProbe(const char *where);
+#endif
+
 static bool LoadShaderApi(void) {
 #ifdef __ANDROID__
   /* GLES2 core entry points link directly; SDL_GL_GetProcAddress is only
@@ -573,6 +581,18 @@ bool Dkc2SdlPresenterInit(Dkc2SdlPresenter *presenter, int window_scale,
   }
   presenter->base_uniform_source =
       s_gl.GetUniformLocation(presenter->base_program, "source");
+  glGenBuffers(1, &s_quad_vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, s_quad_vbo);
+  glBufferData(GL_ARRAY_BUFFER, sizeof kQuadVertices, kQuadVertices,
+               GL_STATIC_DRAW);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  if (s_quad_vbo == 0) {
+    SetError(error, error_capacity, "GLES2 quad VBO creation failed");
+    SDL_GL_DeleteContext(context);
+    SDL_DestroyWindow(window);
+    return false;
+  }
+  LogGlErrorProbe("init");
 #endif
   return true;
 }
@@ -644,21 +664,40 @@ void Dkc2SdlPresenterArmCapture(Dkc2SdlPresenter *presenter, uint8_t *rgb,
 }
 
 #ifdef __ANDROID__
+/* Fullscreen quad as two explicit GL_TRIANGLES. NDC positions with the
+ * matching texture coordinates (row 0 of the frame maps to the top edge
+ * of the viewport). Six vertices remove any reliance on how a driver
+ * splits a 4-vertex strip into triangles. */
 static const GLfloat kQuadVertices[] = {
     -1.0f, -1.0f, 0.0f, 1.0f,
+     1.0f, -1.0f, 1.0f, 1.0f,
+     1.0f,  1.0f, 1.0f, 0.0f,
+
      1.0f, -1.0f, 1.0f, 1.0f,
      1.0f,  1.0f, 1.0f, 0.0f,
     -1.0f,  1.0f, 0.0f, 0.0f,
 };
 
 static void DrawFrameQuad(void) {
-  glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
-                        kQuadVertices);
+  glBindBuffer(GL_ARRAY_BUFFER, s_quad_vbo);
+  glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), NULL);
   glEnableVertexAttribArray(0);
   glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
-                        kQuadVertices + 2);
+                        (const GLvoid *)(size_t)(2 * sizeof(GLfloat)));
   glEnableVertexAttribArray(1);
-  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+  glDrawArrays(GL_TRIANGLES, 0, 6);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+/* Surface one GL error per site to logcat; silent GLES2 failures were
+ * impossible to diagnose on device. glGetError clears the flag, which is
+ * fine for a probe. */
+static unsigned int s_logged_gl_error;
+static void LogGlErrorProbe(const char *where) {
+  GLenum error = glGetError();
+  if (error == GL_NO_ERROR || error == s_logged_gl_error) return;
+  s_logged_gl_error = error;
+  SDL_Log("DKC2 GLES2: GL error 0x%04x at %s", (unsigned)error, where);
 }
 #else
 static void DrawFrameQuad(void) {
@@ -690,6 +729,21 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
   int output_width = 0;
   int output_height = 0;
   SDL_GL_GetDrawableSize(window, &output_width, &output_height);
+#ifdef __ANDROID__
+  /* The Android surface is destroyed and recreated behind the same EGL
+   * context (file picker, rotation, task switches). The GL objects survive
+   * a pure surface swap but the safe policy after any surface geometry
+   * change is to redefine the frame texture fully on the next upload and
+   * re-check the error state. */
+  if (output_width != presenter->surface_width ||
+      output_height != presenter->surface_height) {
+    presenter->surface_width = output_width;
+    presenter->surface_height = output_height;
+    presenter->texture_width = 0;
+    presenter->texture_height = 0;
+    LogGlErrorProbe("surface-change");
+  }
+#endif
   Dkc2DesktopViewport viewport;
   if (!Dkc2DesktopComputeViewport(output_width, output_height,
                                   source_width, source_height, &viewport))
@@ -716,6 +770,13 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
                  GL_BGRA,
 #endif
                  GL_UNSIGNED_BYTE, pixels);
+#ifdef __ANDROID__
+    /* NPOT textures in GLES2 require CLAMP_TO_EDGE; re-assert the wrap
+     * whenever the texture storage is redefined. */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    LogGlErrorProbe("texture-alloc");
+#endif
     presenter->texture_width = source_width;
     presenter->texture_height = source_height;
   } else {
@@ -726,6 +787,9 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
                     GL_BGRA,
 #endif
                     GL_UNSIGNED_BYTE, pixels);
+#ifdef __ANDROID__
+    LogGlErrorProbe("texture-upload");
+#endif
   }
   const bool reconstruct =
       presenter->upscaler == kDkc2UpscalerReconstruct && presenter->program;
@@ -776,6 +840,9 @@ bool Dkc2SdlPresenterPresent(Dkc2SdlPresenter *presenter,
   }
 #endif
   DrawFrameQuad();
+#ifdef __ANDROID__
+  LogGlErrorProbe("draw");
+#endif
   /* Offscreen capture: draw the same frame into a framebuffer object and
    * read it back. A hidden window's back buffer reads back empty on macOS,
    * so the capture never depends on the window being displayed. */
@@ -908,6 +975,12 @@ void Dkc2SdlPresenterDestroy(Dkc2SdlPresenter *presenter) {
   if (presenter->window && presenter->gl_context)
     (void)SDL_GL_MakeCurrent((SDL_Window *)presenter->window,
                             (SDL_GLContext)presenter->gl_context);
+#ifdef __ANDROID__
+  if (s_quad_vbo) {
+    glDeleteBuffers(1, &s_quad_vbo);
+    s_quad_vbo = 0;
+  }
+#endif
   if (presenter->texture) glDeleteTextures(1, &presenter->texture);
   if (presenter->program) s_gl.DeleteProgram(presenter->program);
 #ifdef __ANDROID__

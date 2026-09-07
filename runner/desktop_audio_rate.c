@@ -45,7 +45,14 @@ int Dkc2AudioStretchProcess(Dkc2AudioStretch *stretch, double ratio,
   }
   stretch->last[0] = in[(in_frames - 1) * 2];
   stretch->last[1] = in[(in_frames - 1) * 2 + 1];
-  stretch->position = position - (double)in_frames;
+  position -= (double)in_frames;
+  /* A capacity exit stops inside the current input, whose remainder the
+   * caller discards; carrying the negative position across calls would
+   * index before in[] on the next call. Restart from the kept last pair
+   * instead (one interpolated seam sample, inaudible, pathological case
+   * only). */
+  if (position < 0.0) position = 0.0;
+  stretch->position = position;
   return written;
 }
 

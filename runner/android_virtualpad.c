@@ -74,6 +74,8 @@ void Dkc2AndroidVirtualPadQuit(void) {
   s_device_index = -1;
 }
 
+int Dkc2AndroidVirtualPadDeviceIndex(void) { return s_device_index; }
+
 void Dkc2AndroidVirtualPadLeftStick(float x, float y) {
   if (!s_virtual_joystick) return;
   s_left_x = x < -1.0f ? -1.0f : (x > 1.0f ? 1.0f : x);

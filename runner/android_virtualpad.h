@@ -36,6 +36,10 @@ void Dkc2AndroidVirtualPadInit(void);
  * state so Init can attach again in a later host run. */
 void Dkc2AndroidVirtualPadQuit(void);
 
+/* Device index of the attached virtual pad, or -1 when absent. The host
+ * input scan uses it to open the pad first. */
+int Dkc2AndroidVirtualPadDeviceIndex(void);
+
 /* Set one logical button's pressed state. Ignored before Init. */
 void Dkc2AndroidVirtualPadButton(int button, int pressed);
 

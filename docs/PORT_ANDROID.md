@@ -139,6 +139,25 @@ The CMake configure fetches SDL 2.30.9 (pinned, shallow) on first run.
   file can now be picked; wrong picks are still rejected by the ≥4 MB Java
   gate and the SHA-256 gate in the native runtime (self-healing
   `.rejected` parking), so the picker reopens with a clear toast.
+- **Touch controls = player 1.** `android_main.c` pins
+  `player_src[0]` to the gamepad source before launching the host: the
+  shared default routes player 1 to the keyboard, and a keyboard-source
+  player never consumes a gamepad, so the virtual pad silently became
+  player 2 and the title screen never saw Start. A Bluetooth pad joins as
+  player 2.
+- **Orientation is re-locked in native code.** SDL overwrites the
+  manifest's `sensorLandscape` with `FULL_USER` when the window is
+  created (rotatable in-session, EGL surface churn on rotation);
+  `SDL_HINT_ORIENTATIONS` restores the landscape lock.
+- **GLES2 present path.** The frame quad is a VBO drawn as two explicit
+  triangles (a client-side 4-vertex TRIANGLE_STRIP lost its second
+  triangle on a reported Adreno tiler: frozen black half-frame along the
+  quad diagonal); any drawable-size change forces a full texture
+  redefine; one GL error per site is surfaced via `SDL_Log` (logcat:
+  `DKC2 GLES2: GL error ...`).
+- **Audio telemetry.** The obtained audio spec, open failures, the 48 kHz
+  fallback, and backgrounding/foreground queue sizes log to logcat
+  (`audio: ...`), so field reports can be diagnosed without repro.
 - **Signing:** CI release APKs are signed with the project keystore stored
   in the `DKC2_RELEASE_*` Actions secrets (created once at setup). The
   keystore and its password live outside Git; keep a private backup, APK

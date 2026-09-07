@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.0.7-android
+
+Device-validated fix round from the moto g34 5G diagnostics (logcat,
+gameplay capture, screenshots) — four critical sub-reviews (rendering,
+input, audio, UX) before implementation; all 49 host tests pass.
+
+- **Touch controls now drive player 1.** The shared launcher default
+  routes player 1 to the keyboard; on a phone the virtual gamepad then
+  landed on player 2 and the title screen (joypad 1) waited for Start
+  forever. `android_main.c` pins player 1 to the gamepad source; player 2
+  keeps the gamepad slot for a Bluetooth pad.
+- **Render path hardened for Adreno GLES2.** The full-screen quad moved
+  from client-side 4-vertex TRIANGLE_STRIP arrays into a VBO drawn as two
+  explicit GL_TRIANGLES — on the reporting device the strip's second
+  triangle never rasterized, leaving a frozen black half of the frame
+  along the quad's diagonal. Also: wrap parameters re-asserted on texture
+  redefinition, surface-size changes force a full texture redefine
+  (picker/rotation EGL cycles), and one GL error per site is surfaced to
+  logcat.
+- **Input survives Android focus quirks.** ReadControls no longer zeroes
+  all input when SDL_WINDOW_INPUT_FOCUS flickers (rotation/overlay
+  windows); the virtual pad is opened first in the controller scan so an
+  OEM joystick at index 0 cannot push it out of the window; the SDL
+  orientation hint re-locks sensorLandscape (SDL otherwise overrides the
+  manifest to FULL_USER at window creation and the game rotated to
+  portrait mid-session).
+- **Touch layout rebuilt.** True SNES diamond (X top / Y left / A right /
+  B bottom) with non-overlapping hit circles, plus-shaped 8-way D-pad
+  with arrow triangles and a dead-zone hub, pressed feedback with
+  invalidation (the old pressedFill was dead code), L/R clear of the
+  status bar, START/SELECT above the gesture bar, ROM button smaller and
+  tap-confirmed, nearest-center hit priority, face slide-release with
+  hysteresis, and a portrait fallback layout.
+- **Audio observability + hardening.** The obtained spec, open failures,
+  backgrounding/foreground queue state and the 48 kHz fallback ladder are
+  logged to logcat; the ring reports the device rate through
+  RtlSetAudioOutputRate; a transient SDL_QueueAudio failure retries once
+  after shedding the backlog instead of muting the session; the stretch
+  resampler clamps a negative carry-over position (latent negative-index
+  read).
+- **Physical HID gamepads restored on Android 14+.** The vendored SDL
+  HIDDeviceManager registered broadcast receivers without the
+  RECEIVER_NOT_EXPORTED flag targetSdk 34 requires, which threw and
+  disabled all HIDAPI pads; USB/Bluetooth pads register compatibly now.
+- `DKC2_HEADLESS_ONLY` CMake option builds the headless runner and tests
+  without system OpenGL; the headless target and the interp-bridge test
+  link libm explicitly.
+
+
+## 0.0.6-android
+
+- ROM picker accepted every file type: EXTRA_MIME_TYPES acted as an
+  exclusive whitelist and `.sfc` mapped to device-dependent MIME types,
+  rendering the ROM greyed-out/unselectable on some devices.
+
+
 ## 0.0.5-android.1
 
 - First Android build (arm64-v8a, API 26+): Gradle/NDK project wrapping the

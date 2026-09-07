@@ -16,6 +16,7 @@
 #include <SDL.h>
 
 #include "android_virtualpad.h"
+#include "desktop_input.h"
 #include "desktop_launcher.h"
 #include "diagnostics.h"
 #include "launcher.h"
@@ -75,6 +76,13 @@ int SDL_main(int argc, char *argv[]) {
   RecompLauncherCSettings settings;
   Dkc2LauncherSettingsDefault(&settings);
   Dkc2LauncherSettingsLoad(&settings);
+  /* Phones have no hardware keyboard, and the shared default routes
+   * player 1 to it (desktop convention). A keyboard-source player never
+   * consumes a gamepad, so the virtual pad landed on player 2 and the
+   * title screen — which polls joypad 1 — waited for Start forever.
+   * Player 1 must read the (virtual) gamepad; player 2 keeps the gamepad
+   * slot so a Bluetooth pad can still join as P2. */
+  settings.player_src[0] = kDkc2InputSourceGamepad;
 
   if (!rom_path[0]) {
     (void)Dkc2LauncherReadRomCache(rom_path, sizeof rom_path);

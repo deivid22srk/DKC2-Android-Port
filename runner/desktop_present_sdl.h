@@ -44,10 +44,18 @@ typedef struct Dkc2SdlPresenter {
   int uniform_softness;
   int uniform_shading;
 #ifdef __ANDROID__
-  /* GLES2 has no fixed-function path: the base textured-quad program is
-   * always built at Init, and every Present goes through a program. */
+/* GLES2 has no fixed-function path: the base textured-quad program is
+ * always built at Init, and every Present goes through a program. The
+ * fullscreen quad lives in a VBO drawn as two explicit triangles: the
+ * original client-side 4-vertex TRIANGLE_STRIP lost its second triangle
+ * on at least one Adreno tiler (left half of the frame stayed at the
+ * clear color), so the present path avoids both client arrays and
+ * strip-splitting entirely. */
   unsigned int base_program;
   int base_uniform_source;
+  unsigned int quad_vbo;
+  int surface_width;
+  int surface_height;
 #endif
   char shader_error[160];
   /* Optional one-shot drawable capture: the next presented frame's drawable
