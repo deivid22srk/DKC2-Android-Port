@@ -118,3 +118,20 @@ The CMake configure fetches SDL 2.30.9 (pinned, shallow) on first run.
   in-game pause overlay once opened from a gamepad Start mapping.
 - First-run experience requires the SAF picker; no direct scan of shared
   storage (scoped-storage friendly by design).
+
+## Known behaviors (mobile)
+
+- **Rejected ROM parking:** any non-zero game exit parks the loaded file as
+  `rom.sfc.rejected` so the next launch reopens the picker. This includes
+  non-ROM failures (e.g. GLES unavailable), so an environmental error costs
+  one ROM re-pick; the parked file is overwritten on the next parking.
+- **First run:** the native `SDL_main` stays alive while the SAF picker is
+  open (screen stays black behind it); picking a file starts the game in
+  the same activity. Cancel still leaves the overlay ROM button usable.
+- **Replace-ROM flow** (overlay ROM button while playing) recreates the
+  activity; SDL2 2.30.9's Java glue may briefly finish the old instance —
+  reopening the app resumes with the newly selected ROM.
+- **Signing:** CI release APKs are signed with the project keystore stored
+  in the `DKC2_RELEASE_*` Actions secrets (created once at setup). The
+  keystore and its password live outside Git; keep a private backup, APK
+  updates must reuse the same key.
