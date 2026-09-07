@@ -1,0 +1,342 @@
+name: release
+
+# Publishes a SIGNED release APK as a GitHub Release.
+#
+# Differences from build.yml (the every-push pipeline):
+#   - builds only assembleRelease (no debug APK);
+#   - REQUIRES the DKC2_RELEASE_* signing secrets — no debug-key fallback,
+#     the job fails before building if any secret is missing;
+#   - verifies the APK signature with apksigner and rejects the Android
+#     debug certificate;
+#   - publishes a GitHub Release with the signed APK, its SHA-256 and the
+#     full port changelog as the release body.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag da release (vazio = v<versionName> lido do build.gradle.kts)"
+        required: false
+        default: ""
+      overwrite:
+        description: "Substituir a tag/release caso ja exista (true/false)"
+        required: false
+        default: "true"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with pinned snesrecomp submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust (native snesrecomp analyzer)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Android SDK components
+        run: |
+          set -euo pipefail
+          SDKM="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "build-tools;34.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.31.6"
+
+      - name: Fetch the verified ROM from the private archive
+        id: rom
+        env:
+          ROM_TOKEN: ${{ secrets.ROM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ROM_TOKEN}" ]; then
+            echo "::error::Missing secret ROM_TOKEN (a GitHub token with access to deivid22srk/DKC2Recomp-Archive)."
+            exit 1
+          fi
+          # Release asset id 547932024 = "Donkey Kong Country 2 - Diddy's Kong
+          # Quest (USA) (En,Fr).sfc" zipped (the exact SHA-256 the recomp pins).
+          curl -fsSL \
+            -H "Authorization: Bearer ${ROM_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            -o rom.zip \
+            "https://api.github.com/repos/deivid22srk/DKC2Recomp-Archive/releases/assets/547932024"
+          rm -rf romdir && mkdir romdir
+          unzip -o -q rom.zip -d romdir
+          ROM="$(find romdir -type f \( -name '*.sfc' -o -name '*.smc' \) | head -n 1)"
+          if [ -z "${ROM}" ]; then
+            echo "::error::No .sfc/.smc found inside the downloaded archive."
+            exit 1
+          fi
+          ACTUAL="$(sha256sum "${ROM}" | cut -d' ' -f1)"
+          EXPECTED="35421a9af9dd011b40b91f792192af9f99c93201d8d394026bdfb42cbf2d8633"
+          SIZE="$(stat -c%s "${ROM}")"
+          echo "ROM: ${ROM} (${SIZE} bytes)"
+          echo "SHA-256: ${ACTUAL}"
+          if [ "${ACTUAL}" != "${EXPECTED}" ] || [ "${SIZE}" != "4194304" ]; then
+            echo "::error::The archived ROM is not the supported DKC2 USA v1.0 baseline (expected SHA-256 ${EXPECTED}, 4194304 bytes). Re-upload the verified dump to the private archive."
+            exit 1
+          fi
+          echo "rom=${ROM}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate private snesrecomp sources
+        run: |
+          python3 scripts/generate_snesrecomp.py \
+            --rom "${{ steps.rom.outputs.rom }}" \
+            --analysis-backend native
+          echo "Generated source files: $(ls generated/snesrecomp | wc -l)"
+
+      - name: Require the release keystore (no debug fallback on a published release)
+        env:
+          KEYSTORE_B64: ${{ secrets.DKC2_RELEASE_KEYSTORE_B64 }}
+          STORE_PASS: ${{ secrets.DKC2_RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.DKC2_RELEASE_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.DKC2_RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          if [ -z "${KEYSTORE_B64}" ]; then missing="${missing} DKC2_RELEASE_KEYSTORE_B64"; fi
+          if [ -z "${STORE_PASS}" ]; then missing="${missing} DKC2_RELEASE_STORE_PASSWORD"; fi
+          if [ -z "${KEY_ALIAS}" ]; then missing="${missing} DKC2_RELEASE_KEY_ALIAS"; fi
+          if [ -z "${KEY_PASS}" ]; then missing="${missing} DKC2_RELEASE_KEY_PASSWORD"; fi
+          if [ -n "${missing}" ]; then
+            echo "::error::Publishing a release requires the signing secrets; missing:${missing}."
+            echo "::error::A release must never fall back to the Android debug key."
+            exit 1
+          fi
+          echo "${KEYSTORE_B64}" | base64 -d > "${RUNNER_TEMP}/dkc2-release.keystore"
+          echo "DKC2_RELEASE_STORE_FILE=${RUNNER_TEMP}/dkc2-release.keystore" >> "$GITHUB_ENV"
+          echo "DKC2_RELEASE_STORE_PASSWORD=${STORE_PASS}" >> "$GITHUB_ENV"
+          echo "DKC2_RELEASE_KEY_ALIAS=${KEY_ALIAS}" >> "$GITHUB_ENV"
+          echo "DKC2_RELEASE_KEY_PASSWORD=${KEY_PASS}" >> "$GITHUB_ENV"
+
+      - name: Build release APK (arm64-v8a)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Verify the APK is signed with the release key (reject the debug fallback)
+        run: |
+          set -euo pipefail
+          APK="android/app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "${APK}" ]; then
+            echo "::error::app-release.apk was not produced."
+            exit 1
+          fi
+          APKSIGNER="${ANDROID_HOME}/build-tools/34.0.0/apksigner"
+          CERTS="$("${APKSIGNER}" verify --print-certs "${APK}")"
+          echo "${CERTS}"
+          if echo "${CERTS}" | grep -q "CN=Android Debug"; then
+            echo "::error::The release APK is signed with the Android DEBUG key; refusing to publish."
+            exit 1
+          fi
+          "${APKSIGNER}" verify "${APK}"
+
+      - name: Derive release metadata
+        id: meta
+        env:
+          RELEASE_TAG_INPUT: ${{ github.event.inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          VERSION_NAME="$(grep -oP 'versionName\s*=\s*"\K[^"]+' android/app/build.gradle.kts)"
+          VERSION_CODE="$(grep -oP 'versionCode\s*=\s*\K[0-9]+' android/app/build.gradle.kts)"
+          TAG="${RELEASE_TAG_INPUT}"
+          if [ -z "${TAG}" ]; then
+            TAG="v${VERSION_NAME}"
+          fi
+          OUT_NAME="DKC2Recomp-${TAG}-arm64.apk"
+          cp android/app/build/outputs/apk/release/app-release.apk "${OUT_NAME}"
+          SHA="$(sha256sum "${OUT_NAME}" | cut -d' ' -f1)"
+          SIZE="$(stat -c%s "${OUT_NAME}")"
+          echo "Tag: ${TAG}  |  versionName: ${VERSION_NAME}  |  versionCode: ${VERSION_CODE}"
+          echo "APK: ${OUT_NAME}  |  ${SIZE} bytes  |  SHA-256: ${SHA}"
+          {
+            echo "tag=${TAG}"
+            echo "version_name=${VERSION_NAME}"
+            echo "version_code=${VERSION_CODE}"
+            echo "out_name=${OUT_NAME}"
+            echo "sha256=${SHA}"
+            echo "size=${SIZE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write the release notes
+        run: |
+          cat > release_notes.md <<'EOF'
+          # DKC2Recomp — Port Android
+
+          Port Android do DKC2Recomp (recompilação estática do SNES): o jogo roda
+          em código nativo AOT gerado da ROM original, sobre um host SDL 2.30.9
+          estático, com pipeline de vídeo OpenGL ES 2.0. APK `arm64-v8a`
+          **assinado com o keystore de release** e compilado no GitHub Actions a
+          partir da ROM verificada (gate de SHA-256 + tamanho exato antes de
+          qualquer geração de código).
+
+          ## O que foi feito no port
+
+          ### Núcleo
+          - Build Android completo: Gradle + NDK r27/CMake, `arm64-v8a`, SDL
+            2.30.9 estático via FetchContent; fontes do jogo geradas pelo
+            snesrecomp com análise nativa (Rust) direto da ROM no CI — a ROM
+            nunca vai para o Git.
+          - Pipeline de vídeo GLES2 dedicado (`desktop_present_sdl.c`): contexto
+            ES2 explícito, quad de apresentação, conversão BGRA→RGBA e alias do
+            FBO da core.
+          - Gamepad virtual por toque + controles USB/Bluetooth (HIDAPI), com
+            deadzone analógica configurável (P1 virtual, P2 Bluetooth).
+
+          ### Correções validadas em dispositivo real (moto g34 5G)
+          - **Tela congelada em diagonal (Adreno GLES2)**: o quad full-screen
+            saiu do TRIANGLE_STRIP com vértices em array e virou um VBO em
+            GL_TRIANGLES explícitos; wrap reafirmado na redefinição de textura,
+            mudança de superfície força redefinição completa e erros GL vão ao
+            logcat.
+          - **Gamepad virtual não chegava ao jogo**: player 1 fixado na origem
+            do gamepad (`android_main.c`); o pad virtual abre primeiro na
+            varredura de controles para não perder o índice 0 para joysticks
+            OEM.
+          - **Entrada zerada ao perder foco**: ReadControls não zera mais o
+            input quando SDL_WINDOW_INPUT_FOCUS pisca (rotação/overlay); a
+            orientação é re-travada em sensorLandscape.
+          - **Layout de toque reconstruído**: losango SNES verdadeiro (X cima /
+            Y esquerda / A direita / B baixo), D-pad de 8 direções com setas e
+            hub morto, prioridade pelo centro mais próximo, slide-release com
+            histerese, L/R fora da status bar, START/SELECT acima da gesture
+            bar, fallback em retrato.
+          - **Áudio endurecido**: spec obtida, falhas de abertura e fallback
+            48 kHz logados; retry único de SDL_QueueAudio descartando o backlog
+            em vez de mutar a sessão; clamp do resampler (leitura de índice
+            negativo latente).
+          - **Controles HID no Android 14+**: receivers do HIDDeviceManager da
+            SDL registrados com RECEIVER_NOT_EXPORTED (obrigatório no targetSdk
+            34); pads USB/Bluetooth voltaram a funcionar.
+          - **ROM cinza no seletor (SAF)**: EXTRA_MIME_TYPES agia como whitelist
+            exclusiva e acizentava a ROM; removido — `*/*` +
+            `CATEGORY_OPENABLE`.
+          - **Wedge persistente de renderização**: quad entalhado (notched
+            quad) + tamanho de drawable travado (latched drawable size)
+            corrigidos.
+          - **Tela cheia de verdade**: immersive sticky reafirmada no
+            onWindowFocusChanged, sem status/navigation bar.
+          - **Reconhecido como jogo**: `android:appCategory="game"` +
+            `android:isGame="true"`, landscape sensor.
+          - **Crash e primeiros passos**: crash com nome de jogo NULL, fluxo do
+            picker na primeira execução e teardown do pad virtual corrigidos.
+
+          ### Tela inicial (Port Screen Template, Jetpack Compose)
+          - `LauncherActivity` como entry point: fundo parallax cinematográfico
+            com film grain, partículas de brasa, título dourado animado, botão
+            primário glassmorphism, área de status com ícone/cor/micro-animação
+            por fase, sheet de créditos ("Portado por Hailgames"), edge-to-edge
+            imersivo, adaptado a retrato e paisagem (duas colunas a partir de
+            560 dp) e respeitando o "remover animações" da acessibilidade.
+          - Fluxo de ROM com validação de paridade nativa (`RomStager` espelha
+            `runner/verified_rom.c`: cópia em streaming, skip do header de
+            copier de 512 bytes, payload exato de 4 MiB, SHA-256 fixado);
+            seleção por arquivo ou por pasta (escaneia por extensão e estaga
+            por hash); grant persistente sobrevive a reboots; troca atômica
+            (temp + rename) e auto-cura de staging corrompido.
+          - Arte própria (selva noturna, ruínas, névoa, tochas — sem assets da
+            franquia), paleta dourado-âmbar, créditos ao projeto base
+            (mstan/DKC2Recomp).
+          - Stack: Kotlin 2.0.21 + Compose (compileSdk 35, targetSdk 34
+            inalterado, Gradle/AGP inalterados).
+
+          ### Configurações honestas — só o que o motor realmente lê
+          - O painel de Configurações grava `filesDir/launcher.cfg` com
+            paridade ao parser C — o mesmo arquivo que
+            `Dkc2LauncherSettingsLoad` lê a cada boot (zero mudança no código
+            nativo do jogo):
+            - Aspecto 4:3 / 16:10 / 16:9 + política de bordas widescreen
+              (reflect / bars / shift / glide);
+            - LUT de vídeo (raw / CRT / composite / trinitron);
+            - Upscaler (nearest / bilinear / reconstruct) + os 4 parâmetros do
+              Reconstruct com os rótulos do overlay desktop;
+            - Áudio liga/desliga + volume; deadzone analógica (P1 virtual +
+              P2 Bluetooth).
+          - Removidos os controles decorativos sem leitor nativo
+            (Renderer/Vulkan, limite de FPS, frame skip, VSync, escala de
+            resolução, latência de áudio, opacidade de overlay, háptica etc.) —
+            controle que o motor ignora é promessa falsa.
+          - Chip técnico verídico: `SDL2 · GLES2 · <ABI em runtime>` — o jogo
+            roda no contexto ES2 solicitado, não na versão máxima GLES do
+            aparelho, e Compose é toolkit de UI, não o motor.
+
+          ## Instalação
+          1. Baixe o APK abaixo e instale (permita "fontes desconhecidas").
+             Requer Android 8.0+ e CPU arm64-v8a.
+          2. Na primeira execução, escolha a ROM quando solicitado — apenas o
+             dump DKC2 USA v1.0 é aceito (verificação de hash dentro do
+             próprio app).
+          3. O jogo roda em tela cheia, landscape, com gamepad de toque.
+
+          ## Notas
+          - A ROM não está incluída (e nem pode ser distribuída); o app valida
+            o dump por hash antes de qualquer uso.
+          - APK release assinado e verificado com `apksigner` neste workflow.
+          EOF
+          {
+            echo ""
+            echo "## Integridade do APK"
+            echo ""
+            echo "| Campo | Valor |"
+            echo "| --- | --- |"
+            echo "| Arquivo | ${{ steps.meta.outputs.out_name }} |"
+            echo "| Versão | ${{ steps.meta.outputs.version_name }} (versionCode ${{ steps.meta.outputs.version_code }}) |"
+            echo "| Commit | ${{ github.sha }} |"
+            echo "| Tamanho | ${{ steps.meta.outputs.size }} bytes |"
+            echo "| SHA-256 | ${{ steps.meta.outputs.sha256 }} |"
+            echo ""
+            echo "Assinado com o keystore de release do projeto; assinatura conferida com apksigner neste workflow."
+          } >> release_notes.md
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OVERWRITE_INPUT: ${{ github.event.inputs.overwrite }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            if [ "${OVERWRITE_INPUT}" != "false" ]; then
+              echo "Release ${TAG} already exists — replacing it (overwrite=true)."
+              gh release delete "${TAG}" --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag
+            else
+              echo "::error::Release ${TAG} already exists and overwrite=false."
+              exit 1
+            fi
+          fi
+          gh release create "${TAG}" "${{ steps.meta.outputs.out_name }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "DKC2Recomp Android ${TAG}" \
+            --notes-file release_notes.md \
+            --latest
+
+      - name: Job summary
+        run: |
+          {
+            echo "## DKC2Recomp Android release ${{ steps.meta.outputs.tag }}"
+            echo ""
+            echo "- APK: ${{ steps.meta.outputs.out_name }} (${{ steps.meta.outputs.size }} bytes)"
+            echo "- SHA-256: ${{ steps.meta.outputs.sha256 }}"
+            echo "- Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${{ steps.meta.outputs.tag }}"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -128,6 +128,21 @@ The CMake configure fetches SDL 2.30.9 (pinned, shallow) on first run.
 5. release signing uses the `DKC2_RELEASE_*` secrets when present and
    falls back to the debug keystore otherwise (installable, re-signable).
 
+`.github/workflows/release.yml` is triggered manually (`workflow_dispatch`):
+
+1. runs the same ROM-gated pipeline as `build.yml` (verified dump, native
+   analysis, source generation);
+2. **requires** the `DKC2_RELEASE_*` signing secrets — the job fails before
+   building if any is missing, because a published release must never fall
+   back to the Android debug key;
+3. builds only `assembleRelease` (arm64-v8a) and verifies the signature
+   with `apksigner`, rejecting the `CN=Android Debug` certificate;
+4. derives the tag from `versionName` (`v<versionName>`, overridable via
+   the `release_tag` input) and publishes a GitHub release with the signed
+   APK, its SHA-256 and the full port changelog as the release body;
+5. re-dispatching with the same tag replaces the previous release
+   (`overwrite` input, default `true`).
+
 ## Known limitations
 
 - arm64-v8a only (per project decision); 32-bit devices are unsupported.
