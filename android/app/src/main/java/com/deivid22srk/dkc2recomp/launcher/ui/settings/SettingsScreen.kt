@@ -1,11 +1,12 @@
 /*
- * Tela de Configurações dedicada — exemplo completo de como um port estende
- * o template sem tocar no layout da tela inicial.
+ * Tela de Configurações dedicada.
  *
  * Visual coerente com a cena principal (mesmo fundo em camadas, partículas e
  * grain), seções em painéis de vidro e controles com alvos de 48 dp. Tudo é
- * persistido por [PortSettingsViewModel]; os valores são templates prontos
- * para serem ligados ao motor do port.
+ * persistido por [PortSettingsViewModel] — e CADA opção desta tela é uma
+ * preferência que o motor nativo de fato consome (chaves de launcher.cfg; ver
+ * [com.deivid22srk.dkc2recomp.launcher.settings.LauncherCfg]). Nada de
+ * controles decorativos: se está aqui, funciona.
  */
 package com.deivid22srk.dkc2recomp.launcher.ui.settings
 
@@ -43,7 +44,7 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Gamepad
-import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Texture
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Icon
@@ -74,19 +75,19 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.deivid22srk.dkc2recomp.launcher.config.PortBranding
-import com.deivid22srk.dkc2recomp.launcher.settings.AspectRatioOption
-import com.deivid22srk.dkc2recomp.launcher.settings.FpsLimitOption
+import com.deivid22srk.dkc2recomp.launcher.settings.AspectOption
+import com.deivid22srk.dkc2recomp.launcher.settings.EdgeOption
 import com.deivid22srk.dkc2recomp.launcher.settings.PortSettings
 import com.deivid22srk.dkc2recomp.launcher.settings.PortSettingsViewModel
-import com.deivid22srk.dkc2recomp.launcher.settings.RendererOption
-import com.deivid22srk.dkc2recomp.launcher.settings.TextureFilterOption
+import com.deivid22srk.dkc2recomp.launcher.settings.ReconstructModeOption
+import com.deivid22srk.dkc2recomp.launcher.settings.ScreenFilterOption
+import com.deivid22srk.dkc2recomp.launcher.settings.UpscalerOption
 import com.deivid22srk.dkc2recomp.launcher.ui.background.AmbientParticles
 import com.deivid22srk.dkc2recomp.launcher.ui.background.GrainOverlay
 import com.deivid22srk.dkc2recomp.launcher.ui.background.ParallaxBackground
 import com.deivid22srk.dkc2recomp.launcher.viewmodel.DataPhase
 import com.deivid22srk.dkc2recomp.launcher.viewmodel.DataSelectionUiState
 import com.deivid22srk.dkc2recomp.launcher.viewmodel.DataSelectionViewModel
-import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
@@ -131,6 +132,10 @@ fun SettingsScreen(
     val config = PortBranding.config
     val accent = config.accent
     val reduceMotion = systemReducedMotion || settings.reduceMotionOverride
+    val aspect = AspectOption.fromIndex(settings.aspectIndex)
+    val upscaler = UpscalerOption.fromIndex(settings.upscaler)
+    val edge = EdgeOption.fromIndex(settings.edgePolicy)
+    val screenFilter = ScreenFilterOption.fromIndex(settings.screenKind)
 
     BoxWithConstraints(
         Modifier
@@ -194,111 +199,145 @@ fun SettingsScreen(
 
                 // ============================ VÍDEO ==========================
                 SettingsSection(title = "Vídeo", icon = Icons.Filled.Tune, accent = accent) {
-                    SettingLabel("Proporção da tela")
+                    SettingLabel("Proporção")
                     Spacer(Modifier.height(8.dp))
-                    AspectRatioPreview(option = settings.aspectRatio, accent = accent)
+                    AspectRatioPreview(ratio = aspect.ratio, label = aspect.label, accent = accent)
                     Spacer(Modifier.height(12.dp))
                     ChoiceChipsRow(
-                        options = AspectRatioOption.entries.toList(),
-                        selected = settings.aspectRatio,
+                        options = AspectOption.entries.toList(),
+                        selected = aspect,
                         accent = accent
                     ) { option ->
-                        onSettingsChange { it.copy(aspectRatio = option) }
+                        onSettingsChange { it.copy(aspectIndex = option.index) }
                     }
+                    SettingHint(
+                        "16:10 e 16:9 ampliam o quadro com a política de borda abaixo; " +
+                            "o jogo autoral permanece 4:3."
+                    )
 
-                    Spacer(Modifier.height(18.dp))
-                    SliderRow(
-                        label = "Escala de resolução",
-                        valueText = settings.resolutionScale.scaleLabel(),
-                        value = settings.resolutionScale,
-                        valueRange = 0.5f..3f,
-                        steps = 9,
-                        accent = accent
-                    ) { value ->
-                        onSettingsChange { it.copy(resolutionScale = value) }
+                    if (aspect != AspectOption.NATIVE) {
+                        Spacer(Modifier.height(16.dp))
+                        SettingLabel("Borda no modo largo")
+                        Spacer(Modifier.height(10.dp))
+                        ChoiceChipsRow(
+                            options = EdgeOption.entries.toList(),
+                            selected = edge,
+                            accent = accent
+                        ) { option ->
+                            onSettingsChange { it.copy(edgePolicy = option.index) }
+                        }
+                        SettingHint(edge.description)
                     }
 
                     Spacer(Modifier.height(16.dp))
-                    SettingLabel("Filtro de textura")
+                    SettingLabel("Modelo de vídeo")
                     Spacer(Modifier.height(10.dp))
                     ChoiceChipsRow(
-                        options = TextureFilterOption.entries.toList(),
-                        selected = settings.textureFilter,
+                        options = ScreenFilterOption.entries.toList(),
+                        selected = screenFilter,
                         accent = accent
                     ) { option ->
-                        onSettingsChange { it.copy(textureFilter = option) }
+                        onSettingsChange { it.copy(screenKind = option.index) }
                     }
+                    SettingHint(screenFilter.description)
 
                     Spacer(Modifier.height(16.dp))
-                    ToggleRow(
-                        label = "VSync",
-                        subtitle = "Sincroniza os quadros com a taxa de atualização",
-                        checked = settings.vsync,
+                    SettingLabel("Upscale")
+                    Spacer(Modifier.height(10.dp))
+                    ChoiceChipsRow(
+                        options = UpscalerOption.entries.toList(),
+                        selected = upscaler,
                         accent = accent
-                    ) { checked ->
-                        onSettingsChange { it.copy(vsync = checked) }
+                    ) { option ->
+                        onSettingsChange { it.copy(upscaler = option.index) }
                     }
+                    SettingHint(upscaler.description)
                 }
 
                 Spacer(Modifier.height(14.dp))
 
-                // ======================== DESEMPENHO =========================
-                SettingsSection(title = "Desempenho", icon = Icons.Filled.Speed, accent = accent) {
-                    SettingLabel("Renderizador")
-                    Spacer(Modifier.height(10.dp))
-                    ChoiceChipsRow(
-                        options = RendererOption.entries.toList(),
-                        selected = settings.renderer,
+                // ================== RECONSTRUCT (EXPERIMENTO) ================
+                if (upscaler == UpscalerOption.RECONSTRUCT) {
+                    SettingsSection(
+                        title = "Reconstruct — experimento",
+                        icon = Icons.Filled.Texture,
                         accent = accent
-                    ) { option ->
-                        onSettingsChange { it.copy(renderer = option) }
-                    }
+                    ) {
+                        SettingLabel("Estágios de reconstrução")
+                        Spacer(Modifier.height(10.dp))
+                        ChoiceChipsRow(
+                            options = ReconstructModeOption.entries.toList(),
+                            selected = ReconstructModeOption.fromIndex(settings.reconstructMode),
+                            accent = accent
+                        ) { option ->
+                            onSettingsChange { it.copy(reconstructMode = option.index) }
+                        }
+                        SettingHint(
+                            "Cada estágio decodifica mais informação do dither do SNES " +
+                                "(rótulos idênticos aos do motor)."
+                        )
 
-                    Spacer(Modifier.height(16.dp))
-                    SettingLabel("Limite de FPS")
-                    Spacer(Modifier.height(10.dp))
-                    ChoiceChipsRow(
-                        options = FpsLimitOption.entries.toList(),
-                        selected = settings.fpsLimit,
-                        accent = accent
-                    ) { option ->
-                        onSettingsChange { it.copy(fpsLimit = option) }
-                    }
+                        Spacer(Modifier.height(16.dp))
+                        SliderRow(
+                            label = "Força das bordas",
+                            valueText = "${settings.reconstructStrength}%",
+                            value = settings.reconstructStrength.toFloat(),
+                            valueRange = 0f..100f,
+                            steps = 19,
+                            accent = accent
+                        ) { value ->
+                            onSettingsChange { it.copy(reconstructStrength = value.roundToInt()) }
+                        }
 
-                    Spacer(Modifier.height(16.dp))
-                    ToggleRow(
-                        label = "Frame skip",
-                        subtitle = "Pula quadros para manter a fluidez em aparelhos fracos",
-                        checked = settings.frameSkip,
-                        accent = accent
-                    ) { checked ->
-                        onSettingsChange { it.copy(frameSkip = checked) }
+                        Spacer(Modifier.height(12.dp))
+                        SliderRow(
+                            label = "Suavidade",
+                            valueText = "${settings.reconstructSoftness}%",
+                            value = settings.reconstructSoftness.toFloat(),
+                            valueRange = 0f..100f,
+                            steps = 19,
+                            accent = accent
+                        ) { value ->
+                            onSettingsChange { it.copy(reconstructSoftness = value.roundToInt()) }
+                        }
+
+                        Spacer(Modifier.height(12.dp))
+                        SliderRow(
+                            label = "Sombreamento",
+                            valueText = "${settings.reconstructShading}%",
+                            value = settings.reconstructShading.toFloat(),
+                            valueRange = 0f..100f,
+                            steps = 19,
+                            accent = accent
+                        ) { value ->
+                            onSettingsChange { it.copy(reconstructShading = value.roundToInt()) }
+                        }
                     }
+                    Spacer(Modifier.height(14.dp))
                 }
-
-                Spacer(Modifier.height(14.dp))
 
                 // =========================== ÁUDIO ===========================
                 SettingsSection(title = "Áudio", icon = Icons.Filled.VolumeUp, accent = accent) {
-                    SliderRow(
-                        label = "Latência do áudio",
-                        valueText = "${settings.audioLatencyMs} ms",
-                        value = settings.audioLatencyMs.toFloat(),
-                        valueRange = 20f..200f,
-                        steps = 8,
+                    ToggleRow(
+                        label = "Ativar áudio",
+                        subtitle = "Liga ou desliga toda a saída de som do motor",
+                        checked = settings.enableAudio,
                         accent = accent
-                    ) { value ->
-                        onSettingsChange { it.copy(audioLatencyMs = value.roundToInt()) }
+                    ) { checked ->
+                        onSettingsChange { it.copy(enableAudio = checked) }
                     }
 
                     Spacer(Modifier.height(12.dp))
-                    ToggleRow(
-                        label = "Silenciar",
-                        subtitle = "Desativa toda a saída de áudio do port",
-                        checked = settings.audioMuted,
+                    SliderRow(
+                        label = "Volume",
+                        valueText = "${settings.volume}%",
+                        value = settings.volume.toFloat(),
+                        valueRange = 0f..100f,
+                        steps = 19,
+                        enabled = settings.enableAudio,
                         accent = accent
-                    ) { checked ->
-                        onSettingsChange { it.copy(audioMuted = checked) }
+                    ) { value ->
+                        onSettingsChange { it.copy(volume = value.roundToInt()) }
                     }
                 }
 
@@ -306,35 +345,17 @@ fun SettingsScreen(
 
                 // ========================= CONTROLES =========================
                 SettingsSection(title = "Controles", icon = Icons.Filled.Gamepad, accent = accent) {
-                    ToggleRow(
-                        label = "Overlay na tela",
-                        subtitle = "Botões virtuais sobre o jogo",
-                        checked = settings.showOverlayControls,
-                        accent = accent
-                    ) { checked ->
-                        onSettingsChange { it.copy(showOverlayControls = checked) }
-                    }
-
-                    Spacer(Modifier.height(12.dp))
                     SliderRow(
-                        label = "Opacidade do overlay",
-                        valueText = "${(settings.overlayOpacity * 100).roundToInt()}%",
-                        value = settings.overlayOpacity,
-                        valueRange = 0.2f..1f,
-                        steps = 7,
+                        label = "Zona morta dos analógicos",
+                        subtitle = "Vale para o gamepad virtual (jogador 1) e para um " +
+                            "controle Bluetooth (jogadores 1 e 2)",
+                        valueText = "${settings.deadzone}%",
+                        value = settings.deadzone.toFloat(),
+                        valueRange = 0f..100f,
+                        steps = 19,
                         accent = accent
                     ) { value ->
-                        onSettingsChange { it.copy(overlayOpacity = value) }
-                    }
-
-                    Spacer(Modifier.height(12.dp))
-                    ToggleRow(
-                        label = "Vibração",
-                        subtitle = "Feedback tátil dos controles virtuais",
-                        checked = settings.hapticFeedback,
-                        accent = accent
-                    ) { checked ->
-                        onSettingsChange { it.copy(hapticFeedback = checked) }
+                        onSettingsChange { it.copy(deadzone = value.roundToInt()) }
                     }
                 }
 
@@ -369,9 +390,8 @@ fun SettingsScreen(
                     SelectionSummary(selectionState, accent)
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        text = "Arquivos esperados: " +
-                            config.expectedDataFiles.joinToString(", ") +
-                            config.acceptableExtensions.joinToString(", ", prefix = " · extensões: "),
+                        text = "Arquivos aceitos: dumps .sfc/.smc/.fig/.swc — o motor " +
+                            "só inicia com o DKC2 USA v1.0 exato (verificação de SHA-256).",
                         color = Color.White.copy(alpha = 0.42f),
                         fontSize = 10.5.sp,
                         lineHeight = 14.sp,
@@ -452,6 +472,18 @@ private fun SettingLabel(text: String) {
         fontSize = 10.5.sp,
         fontWeight = FontWeight.SemiBold,
         letterSpacing = 1.4.sp
+    )
+}
+
+/** Linha de apoio explicativa logo abaixo de um controle. */
+@Composable
+private fun SettingHint(text: String) {
+    Spacer(Modifier.height(6.dp))
+    Text(
+        text = text,
+        color = Color.White.copy(alpha = 0.45f),
+        fontSize = 11.sp,
+        lineHeight = 14.sp
     )
 }
 
@@ -552,6 +584,8 @@ private fun SliderRow(
     valueRange: ClosedFloatingPointRange<Float>,
     steps: Int,
     accent: Color,
+    enabled: Boolean = true,
+    subtitle: String? = null,
     onChange: (Float) -> Unit,
 ) {
     Column {
@@ -559,15 +593,24 @@ private fun SliderRow(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(
-                text = label,
-                color = Color.White.copy(alpha = 0.82f),
-                fontSize = 13.5.sp,
-                modifier = Modifier.weight(1f)
-            )
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = label,
+                    color = Color.White.copy(alpha = if (enabled) 0.82f else 0.40f),
+                    fontSize = 13.5.sp
+                )
+                if (subtitle != null) {
+                    Text(
+                        text = subtitle,
+                        color = Color.White.copy(alpha = 0.45f),
+                        fontSize = 11.sp,
+                        lineHeight = 14.sp
+                    )
+                }
+            }
             Text(
                 text = valueText,
-                color = accent,
+                color = accent.copy(alpha = if (enabled) 1f else 0.4f),
                 fontSize = 12.5.sp,
                 fontWeight = FontWeight.Bold,
                 fontFamily = FontFamily.Monospace
@@ -575,9 +618,10 @@ private fun SliderRow(
         }
         Slider(
             value = value,
-            onValueChange = onChange,
+            onValueChange = { if (enabled) onChange(it) },
             valueRange = valueRange,
             steps = steps,
+            enabled = enabled,
             colors = SliderDefaults.colors(
                 thumbColor = accent,
                 activeTrackColor = accent,
@@ -589,7 +633,7 @@ private fun SliderRow(
 
 /** Pré-visualização do frame do jogo na proporção selecionada. */
 @Composable
-private fun AspectRatioPreview(option: AspectRatioOption, accent: Color) {
+private fun AspectRatioPreview(ratio: Float, label: String, accent: Color) {
     Box(
         Modifier
             .fillMaxWidth()
@@ -599,22 +643,14 @@ private fun AspectRatioPreview(option: AspectRatioOption, accent: Color) {
             val inset = 6.dp.toPx()
             val availW = size.width - inset * 2
             val availH = size.height - inset * 2
-            val ratio = option.ratio
-            val frameW: Float
-            val frameH: Float
-            if (ratio == null || ratio < 0f) {
-                frameW = availW
-                frameH = availH
-            } else {
-                var w = availW
-                var h = w / ratio
-                if (h > availH) {
-                    h = availH
-                    w = h * ratio
-                }
-                frameW = w
-                frameH = h
+            var w = availW
+            var h = w / ratio
+            if (h > availH) {
+                h = availH
+                w = h * ratio
             }
+            val frameW = w
+            val frameH = h
             val left = (size.width - frameW) / 2f
             val top = (size.height - frameH) / 2f
             val corner = CornerRadius(10.dp.toPx(), 10.dp.toPx())
@@ -647,7 +683,7 @@ private fun AspectRatioPreview(option: AspectRatioOption, accent: Color) {
             )
         }
         Text(
-            text = option.label,
+            text = label,
             color = Color.White.copy(alpha = 0.65f),
             fontSize = 10.sp,
             fontWeight = FontWeight.SemiBold,
@@ -660,13 +696,12 @@ private fun AspectRatioPreview(option: AspectRatioOption, accent: Color) {
 /** Resumo do estado atual da seleção de dados (ligado ao ViewModel real). */
 @Composable
 private fun SelectionSummary(state: DataSelectionUiState, accent: Color) {
-    val config = PortBranding.config
     val (label, color) = when (val phase = state.phase) {
-        is DataPhase.Found -> "Pasta pronta · ${phase.fileName}" to Color(0xFF4ADE80)
+        is DataPhase.Found -> "ROM verificada · ${phase.fileName}" to Color(0xFF4ADE80)
         is DataPhase.Validating -> "Validando…" to accent
-        is DataPhase.NotFound -> "A seleção salva não contém os dados esperados." to Color(0xFFFF6B6B)
+        is DataPhase.NotFound -> "A seleção salva não contém a ROM suportada." to Color(0xFFFF6B6B)
         is DataPhase.PermissionError -> "Permissão de leitura revogada." to Color(0xFFFF6B6B)
-        is DataPhase.Idle -> "Nenhuma seleção salva." to Color.White.copy(alpha = 0.55f)
+        is DataPhase.Idle -> "Nenhuma ROM salva." to Color.White.copy(alpha = 0.55f)
     }
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -732,6 +767,3 @@ private fun DangerButton(label: String, enabled: Boolean, onClick: () -> Unit) {
         }
     }
 }
-
-private fun Float.scaleLabel(): String =
-    if (this % 1f == 0f) "${toInt()}x" else String.format(Locale.US, "%.2fx", this)

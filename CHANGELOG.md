@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.0.10-android
+
+Honest settings: the home screen's Settings panel now contains only options
+the native engine actually consumes, and the tech chip shows engine facts
+instead of device marketing. Native game code untouched.
+
+- **Real settings via launcher.cfg.** New `LauncherCfg` writes
+  `filesDir/launcher.cfg` with C-parser parity — the exact file
+  `Dkc2LauncherSettingsLoad` reads at every `SDL_main` boot (zero native
+  changes). Exposed: aspect (4:3/16:10/16:9), widescreen edge policy
+  (reflect/bars/shift/glide), video model LUT (raw/CRT/composite/trinitron),
+  upscaler (nearest/bilinear/reconstruct) with the Reconstruct experiment's
+  four parameters (same labels as the desktop overlay), audio enable +
+  volume, and analog deadzone (virtual pad P1 + Bluetooth P2). The writer
+  keeps `Upscaler`/`TextureFilter` consistent with the engine's no-env
+  resolution rule and preserves unknown keys.
+- **Removed decorative options.** Renderer/Vulkan, FPS limit, frame skip,
+  VSync, resolution scale, texture-filter-only toggle, 21:9 and stretched
+  aspect, audio latency, overlay opacity/visibility and haptics had no
+  native reader on the Android path — a control the engine ignores is a
+  false promise. The old SharedPreferences values remain for the two
+  launcher-effect toggles (particles, reduce motion).
+- **Truthful tech chip.** `COMPOSE · GLES <device max> · <ABI>` became
+  `SDL2 · GLES2 · <ABI>`: the game runs on the static SDL 2.30.9 host with
+  an explicit OpenGL ES 2.0 context (`desktop_present_sdl.c`), not the
+  device's maximum GLES version, and Compose is the UI toolkit, not the
+  engine. ABI stays a runtime `Build.SUPPORTED_ABIS` value.
+- **Aspect preview** redraws for the real aspect enum (4:3 / 16:10 / 16:9)
+  and the widescreen-edge control only appears when the aspect is not the
+  native 4:3.
+
 ## 0.0.9-android
 
 New visual front-end: the Port Screen Template (Kotlin + Jetpack Compose,

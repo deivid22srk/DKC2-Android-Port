@@ -1,7 +1,5 @@
 package com.deivid22srk.dkc2recomp.launcher.ui.components
 
-import android.app.ActivityManager
-import android.content.Context
 import android.os.Build
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -13,30 +11,33 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.deivid22srk.dkc2recomp.launcher.config.PortBranding
 
 /**
- * Chip técnico do canto inferior esquerdo: motor (Compose), versão de GLES
- * e ABI do aparelho — o "canto de credibilidade" típico de menus AAA.
- * Informação real do dispositivo, calculada uma única vez.
+ * Chip técnico do canto inferior esquerdo — o "canto de credibilidade" típico
+ * de menus AAA. Cada token é um fato verificável deste projeto, sem marketing:
+ *
+ *  - SDL2     : o motor do jogo é o host SDL estático (CMake FetchContent
+ *               pin release-2.30.9); é ele quem roda o loop de gameplay.
+ *  - GLES2    : o apresentador cria um contexto OpenGL ES 2.0 explícito
+ *               (runner/desktop_present_sdl.c — SDL_GL_CONTEXT_MAJOR_VERSION 2
+ *               + SDL_GL_CONTEXT_PROFILE_ES). Não exibimos a versão máxima
+ *               que o APARELHO suporta (glEsVersion do device), porque o jogo
+ *               não roda nela: roda no contexto ES2 solicitado.
+ *  - ABI      : detectada em runtime de Build.SUPPORTED_ABIS — e o APK só
+ *               contém arm64-v8a (abiFilters no build.gradle.kts).
+ *
+ * A interface desta tela é Compose, mas isso é instrumento de UI, não o
+ * motor do jogo — por isso não entra no chip.
  */
 @Composable
 fun TechStatusChip(modifier: Modifier = Modifier) {
-    val context = LocalContext.current
     val info = remember {
-        val gl = try {
-            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-            am.deviceConfigurationInfo?.glEsVersion ?: "GLES"
-        } catch (_: Exception) {
-            "GLES"
-        }
-        val abi = Build.SUPPORTED_ABIS.firstOrNull()?.uppercase() ?: ""
-        listOf("COMPOSE", "GLES $gl", abi).joinToString("  ·  ")
+        val abi = Build.SUPPORTED_ABIS.firstOrNull()?.uppercase() ?: "ARM64-V8A"
+        listOf("SDL2", "GLES2", abi).joinToString("  ·  ")
     }
 
     Box(

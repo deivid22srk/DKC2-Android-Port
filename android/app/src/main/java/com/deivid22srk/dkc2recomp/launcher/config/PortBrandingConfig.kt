@@ -309,8 +309,9 @@ object PortBranding {
 
         // ---- Tela de configurações ----------------------------------------
         labelSettingsTitle = "Configurações",
-        labelSettingsSubtitle = "Preferências do port — persistidas no aparelho",
-        labelSettingsFooter = "Opções persistidas em SharedPreferences, prontas para serem ligadas aos parâmetros do motor (PortSettings → engine). Efeitos da tela inicial valem imediatamente.",
+        labelSettingsSubtitle = "Só o que o motor realmente lê — sem opção decorativa",
+        labelSettingsFooter = "Vídeo, áudio e controles são gravados em launcher.cfg e lidos pelo motor nativo a cada partida (mesma fonte das opções do projeto base). Efeitos da tela inicial valem na hora. " +
+            "O jogo em si também tem ajustes próprios no menu de opções.",
         labelClearSelection = "Apagar ROM e seleção salvas",
 
         // ---- Créditos / links do portador ----------------------------------

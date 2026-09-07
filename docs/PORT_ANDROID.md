@@ -198,3 +198,37 @@ The CMake configure fetches SDL 2.30.9 (pinned, shallow) on first run.
   in the `DKC2_RELEASE_*` Actions secrets (created once at setup). The
   keystore and its password live outside Git; keep a private backup, APK
   updates must reuse the same key.
+
+## Real settings (launcher.cfg)
+
+The home screen's Settings panel exposes only preferences the native host
+actually consumes — every control maps 1:1 to a `launcher.cfg` key parsed by
+`Dkc2LauncherSettingsLoad` (`runner/desktop_launcher.c`), the same file the
+base project's desktop launcher writes. `android_main.c` `chdir`s into the
+app's internal files directory before loading, so the Kotlin side
+(`LauncherCfg`) writes `filesDir/launcher.cfg` with C-parser parity
+(`Key=Value`, no padding; unknown lines are dropped, matching sscanf
+behavior). No native code was changed.
+
+Exposed keys, ranges and the consuming site:
+
+| Key | Range | Consumer |
+|-----|-------|----------|
+| `AspectIndex` | 0 native 4:3 / 1 16:10 / 2 16:9 | `sdl_main.c` → `Dkc2VideoSetAspect` |
+| `WidescreenEdge` | 0 reflect / 1 bars / 2 shift / 3 glide | `Dkc2VideoSetEdgePolicy` |
+| `ScreenKind` | 0 raw / 1 crt / 2 composite / 3 trinitron | `Dkc2DesktopColorFilterInit` (CPU color-LUT, applied in the shared present loop) |
+| `Upscaler` | 0 nearest / 1 bilinear / 2 reconstruct | `Dkc2SdlPresenterSetUpscaler` |
+| `TextureFilter` | 0 nearest / 1 bilinear | decides the effective upscaler when `Upscaler != 2` (Android has no `DKC2_UPSCALER` env), so the writer keeps both consistent |
+| `ReconstructMode/Strength/Softness/Shading` | 0..4 / 0..100 ×3 | reconstruct upscaler uniforms (labels mirror the desktop overlay) |
+| `EnableAudio`, `Volume` | 0..1, 0..100 | audio init gate, `host.audio_volume` |
+| `Player1Deadzone`, `Player2Deadzone` | 0..100 | `host.player_deadzone` (virtual pad = P1, Bluetooth pad = P2) |
+
+Deliberately NOT exposed (would be decorative): `AudioFrequency` (the mixer
+pins 32040 Hz), `WindowScale`/`Renderer`/`PlayerNSource` (forced or unused on
+Android), resolution scale, VSync, FPS limit, frame skip, audio latency,
+overlay opacity/visibility and haptics (no native parameter reads them).
+
+The tech chip on the home screen shows engine facts only: `SDL2 · GLES2 ·
+<ABI>` — SDL2 2.30.9 static host, the explicit OpenGL ES 2.0 context the
+presenter requests (not the device's maximum GLES version), and the runtime
+`Build.SUPPORTED_ABIS` value.
