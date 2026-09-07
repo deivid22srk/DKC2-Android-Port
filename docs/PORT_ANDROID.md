@@ -131,6 +131,14 @@ The CMake configure fetches SDL 2.30.9 (pinned, shallow) on first run.
 - **Replace-ROM flow** (overlay ROM button while playing) recreates the
   activity; SDL2 2.30.9's Java glue may briefly finish the old instance —
   reopening the app resumes with the newly selected ROM.
+- **Picker accepts every file type.** `ACTION_OPEN_DOCUMENT` is launched
+  with a bare `*/*` type and deliberately without `EXTRA_MIME_TYPES`:
+  setting that extra replaces the wildcard filter, and because ROM
+  extensions (`.sfc`/`.smc`/`.fig`) map to device/OEM-dependent MIME types,
+  ROMs rendered greyed-out (unselectable) on some devices. Any openable
+  file can now be picked; wrong picks are still rejected by the ≥4 MB Java
+  gate and the SHA-256 gate in the native runtime (self-healing
+  `.rejected` parking), so the picker reopens with a clear toast.
 - **Signing:** CI release APKs are signed with the project keystore stored
   in the `DKC2_RELEASE_*` Actions secrets (created once at setup). The
   keystore and its password live outside Git; keep a private backup, APK

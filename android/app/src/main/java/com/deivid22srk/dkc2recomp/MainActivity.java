@@ -76,13 +76,17 @@ public class MainActivity extends SDLActivity {
     }
 
     private void requestRomPick() {
+        // NOTE: deliberately NO EXTRA_MIME_TYPES. When that extra is set it
+        // REPLACES the "*/*" filter, and only files whose documents provider
+        // reports exactly one of the listed MIME types stay clickable — ROM
+        // extensions (.sfc/.smc/.fig) map to device/OEM-dependent MIME types,
+        // so on several devices the ROM rendered greyed-out and unselectable.
+        // With the bare "*/*" every openable file can be picked; wrong picks
+        // are rejected afterwards by the size gate here and the SHA-256 gate
+        // in the native runtime (self-healing parked .rejected copy).
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
-        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {
-                "application/octet-stream",
-                "application/x-snes-rom",
-        });
         try {
             startActivityForResult(intent, ROM_PICK_REQUEST);
         } catch (android.content.ActivityNotFoundException e) {
